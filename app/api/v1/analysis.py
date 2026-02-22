@@ -1,9 +1,11 @@
 """Plant counting convenience endpoint."""
 
+import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
+from app.config import settings
 from app.jobs.models import JobRecord
 
 router = APIRouter()
@@ -20,6 +22,7 @@ def set_dispatcher(dispatcher):
 class PlantCountRequest(BaseModel):
     image_path: Optional[str] = None
     image_url: Optional[str] = None
+    filename: Optional[str] = None  # just the filename; backend prepends imagery_dir
     model_id: str = "wheat_plant_counter_v1"
 
 
@@ -39,10 +42,14 @@ async def analyze_plant_count(request: PlantCountRequest):
     if _dispatcher is None:
         raise HTTPException(status_code=503, detail="Job dispatcher not initialized")
 
+    # Resolve filename to full path
+    if request.filename and not request.image_path:
+        request.image_path = os.path.join(settings.imagery_dir, request.filename)
+
     if not request.image_path and not request.image_url:
         raise HTTPException(
             status_code=400,
-            detail="Either image_path or image_url must be provided",
+            detail="One of image_path, filename, or image_url must be provided",
         )
 
     job = JobRecord(
@@ -56,5 +63,5 @@ async def analyze_plant_count(request: PlantCountRequest):
     return PlantCountResponse(
         job_id=job_id,
         status="pending",
-        message="Plant counting job submitted. Poll GET /api/v1/jobs/{id} for status.",
+        message="Plant counting job submitted. Poll GET /status/{id} for progress.",
     )

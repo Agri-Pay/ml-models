@@ -5,6 +5,7 @@ counting model to assess crop health.
 """
 
 from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
 import os
 
 from app.config import settings
@@ -51,6 +52,49 @@ async def analyze_drone(
     flight = flights_response.data[0]
     flight_id = flight["id"]
 
+    # Check for cached results in ml_results (24-hour window)
+    model_id = "wheat_plant_counter_v1"
+    try:
+        cache_cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        cached = (
+            supabase.table("ml_results")
+            .select("result_data, image_filename, processing_time_seconds, analyzed_at")
+            .eq("flight_id", flight_id)
+            .eq("model_id", model_id)
+            .gte("analyzed_at", cache_cutoff)
+            .order("analyzed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if cached.data:
+            c = cached.data[0]
+            rd = c.get("result_data") or {}
+            plant_count = rd.get("total_count", 0)
+            avg_size = rd.get("average_size", rd.get("avg_size_px", 0.0)) or 0.0
+            confidence = _score_drone_result(milestone_type, plant_count, avg_size)
+            if confidence >= 0.8:
+                interp = f"Drone analysis strongly supports milestone (cached). {plant_count} plants (avg: {avg_size:.1f}px)"
+            elif confidence >= 0.5:
+                interp = f"Moderate drone evidence (cached). {plant_count} plants (avg: {avg_size:.1f}px)"
+            else:
+                interp = f"Weak drone evidence (cached). {plant_count} plants (avg: {avg_size:.1f}px)"
+            return {
+                "status": "ANALYZED",
+                "confidence": round(confidence, 3),
+                "interpretation": interp,
+                "plant_count": plant_count,
+                "avg_size_px": round(avg_size, 2),
+                "min_size_px": round(rd.get("min_size_px", 0), 2),
+                "max_size_px": round(rd.get("max_size_px", 0), 2),
+                "flight_date": flight["flight_date"],
+                "image_file": c.get("image_filename", ""),
+                "tiles_processed": rd.get("tiles_processed", 0),
+                "source": "cached",
+            }
+    except Exception:
+        pass  # Cache lookup failed — fall through to inference
+
     # Find the image layer
     layers_response = (
         supabase.table("drone_imagery_layers")
@@ -80,7 +124,6 @@ async def analyze_drone(
         }
 
     # Run plant counting model
-    model_id = "wheat_plant_counter_v1"
     model = registry.get(model_id)
     if model is None:
         return {
@@ -110,6 +153,26 @@ async def analyze_drone(
         interpretation = f"Weak drone evidence. Detected {plant_count} plants (avg size: {avg_size:.1f}px)"
     else:
         interpretation = f"No drone evidence of milestone completion. Detected {plant_count} plants"
+
+    # Cache the freshly computed results in ml_results
+    try:
+        supabase.table("ml_results").insert({
+            "farm_id": farm_id,
+            "flight_id": flight_id,
+            "model_id": model_id,
+            "image_filename": filename,
+            "result_data": {
+                "total_count": plant_count,
+                "average_size": avg_size,
+                "min_size_px": result.get("min_size_px", 0),
+                "max_size_px": result.get("max_size_px", 0),
+                "tiles_processed": result.get("tiles_processed", 0),
+            },
+            "processing_time_seconds": result.get("processing_time_seconds"),
+            "analyzed_at": datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception:
+        pass  # Non-critical
 
     return {
         "status": "ANALYZED",
