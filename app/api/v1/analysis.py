@@ -42,9 +42,11 @@ async def analyze_plant_count(request: PlantCountRequest):
     if _dispatcher is None:
         raise HTTPException(status_code=503, detail="Job dispatcher not initialized")
 
-    # Resolve filename to full path
-    if request.filename and not request.image_path:
-        request.image_path = os.path.join(settings.imagery_dir, request.filename)
+    # Resolve filename to full path (only when no image_url fallback exists)
+    if request.filename and not request.image_path and not request.image_url:
+        local_path = os.path.join(settings.imagery_dir, request.filename)
+        if os.path.exists(local_path):
+            request.image_path = local_path
 
     if not request.image_path and not request.image_url:
         raise HTTPException(

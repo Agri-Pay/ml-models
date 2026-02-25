@@ -41,7 +41,12 @@ def run_model_job(job: JobRecord) -> JobRecord:
     # Determine input
     image_path = job.input_params.get("image_path")
     image_url = job.input_params.get("image_url")
-    input_data = image_path or image_url
+    if image_path and os.path.exists(image_path):
+        input_data = image_path
+    elif image_url:
+        input_data = image_url
+    else:
+        input_data = image_path  # will fail at model.predict() with clear error
     if not input_data:
         job.status = JobStatus.FAILED
         job.error = "No image_path or image_url provided"
@@ -194,7 +199,12 @@ app = FastAPI(
 # CORS — allow frontend dev server and any configured origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://agripay.netlify.app",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
