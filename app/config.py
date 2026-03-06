@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     max_image_dimension: int = 50000
 
     # Max upload size (bytes) for drone imagery
-    max_upload_bytes: int = 500 * 1024 * 1024  # 500 MB
+    max_upload_bytes: int = 10 * 1024 * 1024 * 1024  # 10 GB
 
     # Modal (only when dispatch_mode=modal)
     modal_token_id: Optional[str] = None

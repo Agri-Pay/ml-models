@@ -36,8 +36,8 @@ _FILE_TYPE_MAP = {
     "heatmap":       "density_heatmap.png",
 }
 
-# Max upload size: 500 MB
-_MAX_FILE_BYTES = 500 * 1024 * 1024
+# Max upload size: 10 GB
+_MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
