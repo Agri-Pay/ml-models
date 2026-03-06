@@ -114,20 +114,14 @@ async def analyze_drone(
     layer = layers_response.data[0]
     filename = layer["filename"]
 
-    # Construct image path — fall back to Supabase public URL on Modal
+    # Construct image path — images are stored on the server disk
     image_path = os.path.join(settings.imagery_dir, filename)
     if not os.path.exists(image_path):
-        if settings.supabase_url:
-            image_path = (
-                f"{settings.supabase_url}/storage/v1/object/public/"
-                f"drone-imagery/{farm_id}/{filename}"
-            )
-        else:
-            return {
-                "status": "NO_DATA",
-                "confidence": 0.0,
-                "interpretation": f"Drone image file not found: {filename}",
-            }
+        return {
+            "status": "NO_DATA",
+            "confidence": 0.0,
+            "interpretation": f"Drone image file not found on server: {filename}",
+        }
 
     # Run plant counting model
     model = registry.get(model_id)

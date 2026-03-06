@@ -18,12 +18,18 @@ class Settings(BaseSettings):
     compute_dispatch_mode: str = "local"  # "local" or "modal"
     compute_port: int = 8001
 
+    # CORS — comma-separated origins, empty = use defaults
+    cors_origins: str = ""
+
     # Model registry
     max_loaded_models: int = 3
 
     # Job processing
     job_result_ttl_hours: int = 2
     max_image_dimension: int = 50000
+
+    # Max upload size (bytes) for drone imagery
+    max_upload_bytes: int = 500 * 1024 * 1024  # 500 MB
 
     # Modal (only when dispatch_mode=modal)
     modal_token_id: Optional[str] = None

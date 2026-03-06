@@ -8,6 +8,9 @@ python-multipart==0.0.20
 # Database
 supabase==2.11.0
 
+# HTTP client (for TiTiler metadata in imagery upload)
+httpx>=0.27.0
+
 # ML / Deep Learning
 torch>=2.0.0
 torchvision>=0.15.0

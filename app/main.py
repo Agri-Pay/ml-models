@@ -197,14 +197,19 @@ app = FastAPI(
 )
 
 # CORS — allow frontend dev server and any configured origins
+_default_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://agripay.netlify.app",
+]
+if settings.cors_origins:
+    _cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+else:
+    _cors_origins = _default_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://agripay.netlify.app",
-        "*",
-    ],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1,0 +1,52 @@
+# Production Docker Compose for AgriPay Compute Backend
+# Runs on the Linux server with 256GB SSD + 2TB HDD
+#
+# Storage layout:
+#   /mnt/data/imagery  → mounted from 2TB HDD, shared /data volume for TiTiler + compute
+#   SSD                → OS, Docker images, model weights
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f
+
+services:
+  titiler:
+    image: ghcr.io/developmentseed/titiler:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"    # Only accessible via localhost (nginx reverse proxies)
+    volumes:
+      - /mnt/data/imagery:/data:ro  # Read-only: TiTiler only needs to read
+    environment:
+      - TITILER_CORS_ORIGINS=*
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  compute:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8001"    # Only accessible via localhost (nginx reverse proxies)
+    volumes:
+      - /mnt/data/imagery:/data   # Read-write: compute stores uploaded imagery here
+      - ./model_weights:/app/model_weights:ro
+    env_file:
+      - .env
+    environment:
+      - IMAGERY_DIR=/data
+      - MODEL_WEIGHTS_DIR=/app/model_weights
+      - COMPUTE_DISPATCH_MODE=local
+      - TITILER_INTERNAL_URL=http://titiler:8000
+    depends_on:
+      titiler:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
