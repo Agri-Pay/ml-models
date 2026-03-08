@@ -83,13 +83,13 @@ class WheatPlantCounter(BaseModel):
         # Skip VGG pretrained download — checkpoint already contains all weights
         self._count_model = Model(gap=False, load_pretrained_vgg=False).to(device)
         self._count_model.load_state_dict(
-            torch.load(count_path, map_location=device, weights_only=True)
+            torch.load(count_path, map_location=device, weights_only=False)
         )
         self._count_model.eval()
 
         self._size_model = Model(gap=True, load_pretrained_vgg=False).to(device)
         self._size_model.load_state_dict(
-            torch.load(size_path, map_location=device, weights_only=True)
+            torch.load(size_path, map_location=device, weights_only=False)
         )
         self._size_model.eval()
 
