@@ -17,6 +17,7 @@ async def analyze_drone(
     farm_id: str,
     milestone_id: str,
     milestone_type: str,
+    crop_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Analyze drone imagery for milestone verification.
 
@@ -52,8 +53,12 @@ async def analyze_drone(
     flight = flights_response.data[0]
     flight_id = flight["id"]
 
-    # Check for cached results in ml_results (24-hour window)
-    model_id = "wheat_plant_counter_v1"
+    # Determine model based on crop type
+    if crop_name:
+        matching = registry.list_models(crop=crop_name)
+        model_id = matching[0].model_id if matching else "rice_plant_counter_v1"
+    else:
+        model_id = "rice_plant_counter_v1"
     try:
         cache_cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         cached = (

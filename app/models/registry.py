@@ -62,7 +62,7 @@ class ModelRegistry:
         """List registered models, optionally filtered by crop and/or task."""
         specs = [m.spec() for m in self._models.values()]
         if crop:
-            specs = [s for s in specs if s.crop == crop]
+            specs = [s for s in specs if crop in s.crops]
         if task:
             specs = [s for s in specs if s.task == task]
         return specs

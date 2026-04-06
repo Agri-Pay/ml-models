@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # Max upload size (bytes) for drone imagery
     max_upload_bytes: int = 10 * 1024 * 1024 * 1024  # 10 GB
 
+    # Google Drive API key (server-side, for Drive → server downloads)
+    google_drive_api_key: str = ""
+
     # Modal (only when dispatch_mode=modal)
     modal_token_id: Optional[str] = None
     modal_token_secret: Optional[str] = None

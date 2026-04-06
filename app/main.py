@@ -165,6 +165,10 @@ async def lifespan(app: FastAPI):
     print(f"Imagery dir: {settings.imagery_dir}")
     print(f"Model weights dir: {settings.model_weights_dir}")
 
+    # Clean up stale chunked uploads (abandoned more than 24h ago)
+    from app.api.v1.chunked_upload import cleanup_stale_uploads
+    cleanup_stale_uploads(max_age_hours=24)
+
     # Discover models
     print("Discovering models...")
     registry.discover()
@@ -210,7 +214,7 @@ else:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_origin_regex=r"https://.*\.trycloudflare\.com",
+    allow_origin_regex=r"https://.*\.(trycloudflare\.com|ts\.net)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

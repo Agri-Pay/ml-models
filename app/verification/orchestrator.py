@@ -51,6 +51,8 @@ async def verify_milestone(milestone_id: str) -> Dict[str, Any]:
     milestone = milestone_response.data
     cycle = milestone.get("crop_cycles", {})
     farm_id = cycle.get("farm_id")
+    crop_info = cycle.get("crops", {})
+    crop_name = crop_info.get("name", "").lower() if crop_info else None
     template = milestone.get("milestone_templates", {})
     milestone_type = template.get("name", "unknown").lower().replace(" ", "_")
     expected_ndvi = template.get("expected_ndvi_change")
@@ -72,6 +74,7 @@ async def verify_milestone(milestone_id: str) -> Dict[str, Any]:
         farm_id=farm_id,
         milestone_id=milestone_id,
         milestone_type=milestone_type,
+        crop_name=crop_name,
     )
 
     iot_result = await analyze_iot(

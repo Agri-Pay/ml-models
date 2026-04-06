@@ -1,4 +1,4 @@
-"""Wheat plant counting and size estimation model.
+"""Rice plant counting and size estimation model.
 
 Wraps the VGG16-BN encoder-decoder for use in the model registry.
 Handles the full pipeline: tiling, inference, peak detection, NMS, size estimation.
@@ -39,8 +39,8 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-class WheatPlantCounter(BaseModel):
-    """Plant counting + size estimation for wheat crops using VGG16-BN."""
+class RicePlantCounter(BaseModel):
+    """Plant counting + size estimation for rice crops using VGG16-BN."""
 
     def __init__(self):
         self._count_model: Optional[Model] = None
@@ -48,9 +48,9 @@ class WheatPlantCounter(BaseModel):
 
     def spec(self) -> ModelSpec:
         return ModelSpec(
-            model_id="wheat_plant_counter_v1",
-            name="Wheat Plant Counter",
-            crop="wheat",
+            model_id="rice_plant_counter_v1",
+            name="Rice Plant Counter",
+            crops=["rice"],
             task="plant_counting",
             input_type=InputType.GEOTIFF,
             output_types=[
@@ -62,7 +62,7 @@ class WheatPlantCounter(BaseModel):
                 "checkpoint_counting.pth",
                 "checkpoint_size_estimation.pth",
             ],
-            description="Detects and counts individual wheat plants from drone imagery. "
+            description="Detects and counts individual rice plants from drone imagery. "
                         "Also estimates plant size using a separate regression model.",
             version="1.0.0",
             input_size=COUNT_MODEL_SIZE,

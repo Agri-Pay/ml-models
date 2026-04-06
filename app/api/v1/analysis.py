@@ -23,7 +23,7 @@ class PlantCountRequest(BaseModel):
     image_path: Optional[str] = None
     image_url: Optional[str] = None
     filename: Optional[str] = None  # just the filename; backend prepends imagery_dir
-    model_id: str = "wheat_plant_counter_v1"
+    model_id: str  # Required — frontend sends the user-selected model
 
 
 class PlantCountResponse(BaseModel):

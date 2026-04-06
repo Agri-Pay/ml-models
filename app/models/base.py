@@ -25,7 +25,7 @@ class ModelSpec:
     """Metadata describing a registered model."""
     model_id: str
     name: str
-    crop: str
+    crops: List[str]
     task: str
     input_type: InputType
     output_types: List[OutputType]

@@ -20,7 +20,7 @@ async def list_models(
             {
                 "model_id": s.model_id,
                 "name": s.name,
-                "crop": s.crop,
+                "crops": s.crops,
                 "task": s.task,
                 "input_type": s.input_type.value,
                 "output_types": [o.value for o in s.output_types],

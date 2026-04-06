@@ -10,34 +10,25 @@ Endpoints:
 """
 
 import os
-import shutil
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.api.v1.imagery_helpers import (
+    VALID_LAYER_TYPES,
+    build_filename,
+    register_imagery_in_db,
+)
 
 router = APIRouter(prefix="/imagery", tags=["imagery"])
-
-# Valid layer types
-VALID_LAYER_TYPES = {
-    "rgb", "ndvi", "ndre", "moisture", "thermal",
-    "lai", "gndvi", "savi", "nir", "red_edge",
-}
 
 
 def _get_supabase():
     """Late import to avoid import-time failure when Supabase is not configured."""
     from app.db.supabase_client import get_supabase
     return get_supabase()
-
-
-def _build_filename(farm_id: str, flight_date: str, layer_type: str) -> str:
-    """Build a canonical filename: {farmId}_{YYYYMMDD}_{layerType}.tif"""
-    date_str = flight_date.replace("-", "")
-    return f"{farm_id}_{date_str}_{layer_type}.tif"
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +41,7 @@ async def upload_imagery(
     farm_id: str = Form(...),
     flight_date: str = Form(...),          # YYYY-MM-DD
     layer_type: str = Form("rgb"),
+    band_mapping: Optional[str] = Form(None),
     pilot_name: Optional[str] = Form(None),
     drone_model: Optional[str] = Form(None),
     altitude: Optional[float] = Form(None),
@@ -58,6 +50,9 @@ async def upload_imagery(
 
     The file is stored at {imagery_dir}/{filename} where both TiTiler
     and the compute backend can access it via the shared /data volume.
+
+    For multispectral uploads, pass layer_type="multispectral" and optionally
+    a band_mapping JSON string: [{"band_number": 1, "band_name": "Blue", "wavelength": "475nm"}, ...]
     """
     # --- Validation ---
     if not file.filename:
@@ -87,7 +82,7 @@ async def upload_imagery(
         )
 
     # --- Save file to disk ---
-    filename = _build_filename(farm_id, flight_date, layer_type)
+    filename = build_filename(farm_id, flight_date, layer_type)
     dest_path = os.path.join(settings.imagery_dir, filename)
 
     total_bytes = 0
@@ -114,138 +109,18 @@ async def upload_imagery(
             os.remove(dest_path)
         raise HTTPException(status_code=500, detail=f"Failed to save file: {exc}")
 
-    # --- Create/update DB records ---
-    flight_id = None
-    layer_data = None
-
-    try:
-        supabase = _get_supabase()
-
-        # 1. Get or create drone_flight record
-        existing = (
-            supabase.table("drone_flights")
-            .select("id")
-            .eq("farm_id", farm_id)
-            .eq("flight_date", flight_date)
-            .execute()
-        )
-
-        if existing.data:
-            flight_id = existing.data[0]["id"]
-            # Update optional fields if provided
-            updates = {"storage_location": "local"}
-            if pilot_name:
-                updates["pilot_name"] = pilot_name
-            if drone_model:
-                updates["drone_model"] = drone_model
-            if altitude is not None:
-                updates["altitude_meters"] = altitude
-            supabase.table("drone_flights").update(updates).eq("id", flight_id).execute()
-        else:
-            insert_data = {
-                "farm_id": farm_id,
-                "flight_date": flight_date,
-                "storage_location": "local",
-            }
-            if pilot_name:
-                insert_data["pilot_name"] = pilot_name
-            if drone_model:
-                insert_data["drone_model"] = drone_model
-            if altitude is not None:
-                insert_data["altitude_meters"] = altitude
-
-            result = (
-                supabase.table("drone_flights")
-                .insert(insert_data)
-                .execute()
-            )
-            flight_id = result.data[0]["id"]
-
-        # 2. Upsert drone_imagery_layers record
-        layer_record = {
-            "flight_id": flight_id,
-            "layer_type": layer_type,
-            "filename": filename,
-            "file_size_bytes": total_bytes,
-        }
-
-        # Try to get metadata from TiTiler (sibling container at localhost:8000)
-        try:
-            import httpx
-            titiler_url = os.environ.get("TITILER_INTERNAL_URL", "http://titiler:8000")
-            file_url = f"file:///data/{filename}"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                info_resp = await client.get(
-                    f"{titiler_url}/cog/info",
-                    params={"url": file_url},
-                )
-                if info_resp.status_code == 200:
-                    info = info_resp.json()
-                    layer_record["crs"] = info.get("crs")
-                    layer_record["bounds"] = info.get("bounds")
-
-                stats_resp = await client.get(
-                    f"{titiler_url}/cog/statistics",
-                    params={"url": file_url},
-                )
-                if stats_resp.status_code == 200:
-                    layer_record["statistics"] = stats_resp.json()
-        except Exception as e:
-            print(f"TiTiler metadata extraction skipped: {e}")
-
-        # Check if layer already exists for this flight+type
-        existing_layer = (
-            supabase.table("drone_imagery_layers")
-            .select("id")
-            .eq("flight_id", flight_id)
-            .eq("layer_type", layer_type)
-            .execute()
-        )
-
-        if existing_layer.data:
-            # Update existing
-            layer_result = (
-                supabase.table("drone_imagery_layers")
-                .update(layer_record)
-                .eq("id", existing_layer.data[0]["id"])
-                .execute()
-            )
-            layer_data = layer_result.data[0] if layer_result.data else None
-        else:
-            # Insert new
-            layer_result = (
-                supabase.table("drone_imagery_layers")
-                .insert(layer_record)
-                .execute()
-            )
-            layer_data = layer_result.data[0] if layer_result.data else None
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # File saved successfully but DB failed — log but don't delete the file
-        print(f"Warning: File saved to {dest_path} but DB insert failed: {exc}")
-        return JSONResponse(
-            status_code=207,  # Multi-Status
-            content={
-                "success": True,
-                "warning": f"File saved but database update failed: {str(exc)}",
-                "filename": filename,
-                "file_size_bytes": total_bytes,
-                "flight_id": flight_id,
-            },
-        )
-
-    return {
-        "success": True,
-        "flight": {
-            "id": flight_id,
-            "date": flight_date,
-        },
-        "layer": layer_data,
-        "filename": filename,
-        "file_size_bytes": total_bytes,
-    }
+    # --- Register in database ---
+    return await register_imagery_in_db(
+        filename=filename,
+        total_bytes=total_bytes,
+        farm_id=farm_id,
+        flight_date=flight_date,
+        layer_type=layer_type,
+        band_mapping=band_mapping,
+        pilot_name=pilot_name,
+        drone_model=drone_model,
+        altitude=altitude,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,30 +182,29 @@ async def delete_imagery(farm_id: str, filename: str):
     try:
         supabase = _get_supabase()
 
-        # Find the layer
-        layer = (
+        # Find all layers for this filename (may be multiple for multispectral)
+        layers = (
             supabase.table("drone_imagery_layers")
             .select("id, flight_id")
             .eq("filename", filename)
             .execute()
         )
 
-        if layer.data:
-            layer_id = layer.data[0]["id"]
-            flight_id = layer.data[0]["flight_id"]
+        flight_ids = set()
+        for layer in (layers.data or []):
+            flight_ids.add(layer["flight_id"])
+            supabase.table("drone_imagery_layers").delete().eq("id", layer["id"]).execute()
 
-            # Delete the layer
-            supabase.table("drone_imagery_layers").delete().eq("id", layer_id).execute()
-
-            # If this was the last layer for the flight, delete the flight too
+        # If any flight now has no layers, delete it too
+        for fid in flight_ids:
             remaining = (
                 supabase.table("drone_imagery_layers")
                 .select("id")
-                .eq("flight_id", flight_id)
+                .eq("flight_id", fid)
                 .execute()
             )
             if not remaining.data:
-                supabase.table("drone_flights").delete().eq("id", flight_id).execute()
+                supabase.table("drone_flights").delete().eq("id", fid).execute()
 
     except Exception as exc:
         print(f"Warning: File deleted but DB cleanup failed: {exc}")

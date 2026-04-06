@@ -2,7 +2,7 @@
 # Runs on the Linux server with 256GB SSD + 2TB HDD
 #
 # Storage layout:
-#   /mnt/data/imagery  → mounted from 2TB HDD, shared /data volume for TiTiler + compute
+#   /mnt/data  → 2TB HDD (/dev/sdb1) mounted via /etc/fstab
 #   SSD                → OS, Docker images, model weights
 #
 # Usage:

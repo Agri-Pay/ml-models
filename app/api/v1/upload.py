@@ -79,7 +79,7 @@ async def upload_image(file: UploadFile = File(...)):
                 if total > _MAX_FILE_BYTES:
                     dst.close()
                     os.remove(upload_path)
-                    raise HTTPException(status_code=413, detail="File too large (max 500 MB)")
+                    raise HTTPException(status_code=413, detail=f"File too large (max {_MAX_FILE_BYTES // (1024*1024*1024)} GB)")
                 dst.write(chunk)
     except HTTPException:
         raise
