@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     modal_token_id: Optional[str] = None
     modal_token_secret: Optional[str] = None
 
+    # Blockchain oracle (Sepolia escrow release)
+    oracle_private_key: str = ""
+    escrow_contract_address: str = ""
+    oracle_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
