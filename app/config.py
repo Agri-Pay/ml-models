@@ -15,8 +15,29 @@ class Settings(BaseSettings):
     model_weights_dir: str = "/app/model_weights"
 
     # Compute dispatch
-    compute_dispatch_mode: str = "local"  # "local" or "modal"
+    compute_dispatch_mode: str = "local"  # "local", "hpc", or "auto"
     compute_port: int = 8001
+
+    # HPC (Rustam2) — only used when compute_dispatch_mode is "hpc" or "auto"
+    hpc_ssh_host: str = "203.135.63.78"
+    hpc_ssh_port: int = 22
+    hpc_ssh_user: str = ""
+    hpc_ssh_password: str = ""
+    hpc_base_dir: str = "~/agripay"
+    hpc_models_dir: str = "~/agripay/models"
+    hpc_inference_dir: str = "~/agripay/inference"
+    hpc_scratch_dir: str = "/scratch/muhammadtalha/agripay"
+    hpc_conda_env: str = "agripay"
+    hpc_slurm_partition: str = "debug"
+    hpc_slurm_time_limit: str = "00:30:00"
+    hpc_slurm_gpu_type: str = "v100"
+    hpc_slurm_mps: int = 400
+    hpc_slurm_cpus: int = 4
+    hpc_slurm_mem: str = "16G"
+    hpc_max_concurrent_jobs: int = 3
+    hpc_poll_interval_seconds: int = 10
+    hpc_job_timeout_seconds: int = 1800
+    hpc_ssh_timeout_seconds: int = 30
 
     # CORS — comma-separated origins, empty = use defaults
     cors_origins: str = ""

@@ -30,3 +30,7 @@ class JobRecord(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     user_id: Optional[str] = None
+
+    # HPC-specific tracking
+    slurm_job_id: Optional[str] = None
+    dispatch_backend: str = "local"  # "local" or "hpc"

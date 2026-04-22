@@ -74,6 +74,7 @@ async def get_job_status(job_id: str):
         "job_id": job.id,
         "model_id": job.model_id,
         "status": job.status.value,
+        "dispatch_backend": job.dispatch_backend,
         "progress": {
             "current": job.progress_current,
             "total": job.progress_total,
@@ -83,6 +84,9 @@ async def get_job_status(job_id: str):
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
     }
+
+    if job.slurm_job_id:
+        response["slurm_job_id"] = job.slurm_job_id
 
     if job.status == JobStatus.COMPLETED and job.result:
         # Include results but exclude large arrays (heatmap)

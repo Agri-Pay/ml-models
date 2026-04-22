@@ -11,7 +11,7 @@ services:
   compute:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.cpu   # CPU-only locally; GPU is dispatched to HPC
     ports:
       - "8001:8001"
     volumes:
@@ -22,18 +22,11 @@ services:
     environment:
       - IMAGERY_DIR=/data
       - MODEL_WEIGHTS_DIR=/app/model_weights
-      - COMPUTE_DISPATCH_MODE=local
+      # COMPUTE_DISPATCH_MODE comes from .env (do not hardcode here)
       # Blockchain oracle (set in .env)
       - ORACLE_PRIVATE_KEY=${ORACLE_PRIVATE_KEY:-}
       - ESCROW_CONTRACT_ADDRESS=${ESCROW_CONTRACT_ADDRESS:-}
       - ORACLE_RPC_URL=${ORACLE_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     depends_on:
       - titiler
 
@@ -52,7 +45,7 @@ services:
     environment:
       - IMAGERY_DIR=/data
       - MODEL_WEIGHTS_DIR=/app/model_weights
-      - COMPUTE_DISPATCH_MODE=local
+      # COMPUTE_DISPATCH_MODE comes from .env (do not hardcode here)
       # Blockchain oracle (set in .env)
       - ORACLE_PRIVATE_KEY=${ORACLE_PRIVATE_KEY:-}
       - ESCROW_CONTRACT_ADDRESS=${ESCROW_CONTRACT_ADDRESS:-}

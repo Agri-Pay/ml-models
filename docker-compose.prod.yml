@@ -42,8 +42,12 @@ services:
     environment:
       - IMAGERY_DIR=/data
       - MODEL_WEIGHTS_DIR=/app/model_weights
-      - COMPUTE_DISPATCH_MODE=local
+      - COMPUTE_DISPATCH_MODE=${COMPUTE_DISPATCH_MODE:-local}
       - TITILER_INTERNAL_URL=http://titiler:8000
+      # HPC settings (only used when COMPUTE_DISPATCH_MODE=hpc or auto)
+      - HPC_SSH_HOST=${HPC_SSH_HOST:-203.135.63.78}
+      - HPC_SSH_USER=${HPC_SSH_USER:-}
+      - HPC_SSH_PASSWORD=${HPC_SSH_PASSWORD:-}
     depends_on:
       titiler:
         condition: service_healthy

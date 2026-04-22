@@ -4,13 +4,17 @@ Finds the most recent drone image for a farm and runs the plant
 counting model to assess crop health.
 """
 
+import asyncio
 from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
 import os
+import logging
 
 from app.config import settings
 from app.db.supabase_client import get_supabase
 from app.models.registry import registry
+
+logger = logging.getLogger(__name__)
 
 
 async def analyze_drone(
@@ -128,20 +132,28 @@ async def analyze_drone(
             "interpretation": f"Drone image file not found on server: {filename}",
         }
 
-    # Run plant counting model
-    model = registry.get(model_id)
-    if model is None:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": f"Plant counting model '{model_id}' not available",
-        }
+    # Run plant counting model — via dispatcher (HPC/auto) or directly (local)
+    if settings.compute_dispatch_mode in ("hpc", "auto"):
+        result = await _run_via_dispatcher(model_id, image_path)
+        if result is None:
+            return {
+                "status": "NO_DATA",
+                "confidence": 0.0,
+                "interpretation": "Drone analysis failed: HPC dispatch error",
+            }
+    else:
+        model = registry.get(model_id)
+        if model is None:
+            return {
+                "status": "NO_DATA",
+                "confidence": 0.0,
+                "interpretation": f"Plant counting model '{model_id}' not available",
+            }
 
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = registry.ensure_loaded(model_id, device=device)
-
-    result = model.predict(image_path)
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = registry.ensure_loaded(model_id, device=device)
+        result = model.predict(image_path)
 
     plant_count = result.get("plant_count", 0)
     avg_size = result.get("avg_size_px", 0.0)
@@ -191,6 +203,54 @@ async def analyze_drone(
         "image_file": filename,
         "tiles_processed": result.get("tiles_processed", 0),
     }
+
+
+async def _run_via_dispatcher(model_id: str, image_path: str) -> Optional[Dict[str, Any]]:
+    """Submit an inference job through the global dispatcher and wait for results.
+
+    Used when compute_dispatch_mode is "hpc" or "auto" to route inference
+    through the HPC cluster instead of running locally.
+    """
+    from app.jobs.models import JobRecord, JobStatus
+
+    # Get the global dispatcher from main module
+    from app.main import _dispatcher
+    if _dispatcher is None:
+        logger.error("Dispatcher not initialized")
+        return None
+
+    job = JobRecord(
+        model_id=model_id,
+        input_params={"image_path": image_path},
+    )
+
+    try:
+        await _dispatcher.submit(job)
+    except Exception as e:
+        logger.error("Failed to submit job to dispatcher: %s", str(e))
+        return None
+
+    # Poll until complete (with timeout)
+    timeout = settings.hpc_job_timeout_seconds
+    poll_interval = settings.hpc_poll_interval_seconds
+    elapsed = 0
+
+    while elapsed < timeout:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+        status = await _dispatcher.get_status(job.id)
+        if status is None:
+            continue
+
+        if status.status == JobStatus.COMPLETED:
+            return status.result or {}
+        elif status.status == JobStatus.FAILED:
+            logger.error("Dispatcher job %s failed: %s", job.id, status.error)
+            return None
+
+    logger.error("Dispatcher job %s timed out after %ds", job.id, timeout)
+    return None
 
 
 def _score_drone_result(

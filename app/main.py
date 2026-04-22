@@ -20,6 +20,7 @@ from app.jobs.models import JobRecord, JobStatus
 from app.jobs.in_process_queue import InProcessQueue
 from app.storage.temp_results import temp_store
 from app.processing.visualization import (
+    generate_all_visualizations,
     render_counting_overlay,
     render_heatmap,
     render_size_annotated,
@@ -65,72 +66,13 @@ def run_model_job(job: JobRecord) -> JobRecord:
     # Save visualization outputs
     output_files = []
     if "heatmap" in result and "points" in result:
-        job_dir = temp_store.get_job_dir(job.id)
-
-        # Disable PIL decompression bomb check — drone imagery is trusted and large
-        Image.MAX_IMAGE_PIXELS = None
-
-        # Load the original uploaded image for overlays.
-        # Cap at VIZ_MAX_DIM so we never render a 100M-pixel canvas.
-        VIZ_MAX_DIM = 2048
-        W = result.get("image_width", 1024)
-        H = result.get("image_height", 1024)
-
-        image_path = job.input_params.get("image_path")
-        scale = 1.0
-        if image_path and os.path.exists(image_path):
-            try:
-                base_img = Image.open(image_path).convert("RGB")
-                orig_w, orig_h = base_img.size
-                scale = min(1.0, VIZ_MAX_DIM / max(orig_w, orig_h))
-                if scale < 1.0:
-                    viz_w = max(1, int(orig_w * scale))
-                    viz_h = max(1, int(orig_h * scale))
-                    base_img = base_img.resize((viz_w, viz_h), Image.LANCZOS)
-                    print(f"  Viz: downsampled {orig_w}x{orig_h} -> {viz_w}x{viz_h} (scale={scale:.3f})")
-            except Exception as exc:
-                print(f"  Viz: could not open image ({exc}), using blank canvas")
-                scale = min(1.0, VIZ_MAX_DIM / max(W, H))
-                viz_w = max(1, int(W * scale))
-                viz_h = max(1, int(H * scale))
-                base_img = Image.new("RGB", (viz_w, viz_h), (40, 40, 40))
-        else:
-            scale = min(1.0, VIZ_MAX_DIM / max(W, H))
-            viz_w = max(1, int(W * scale))
-            viz_h = max(1, int(H * scale))
-            base_img = Image.new("RGB", (viz_w, viz_h), (40, 40, 40))
-
-        # Scale point coordinates and sizes to match the visualization resolution
-        points = [
-            {"x": int(p["x"] * scale), "y": int(p["y"] * scale), "base_sigma": p.get("base_sigma", 0) * scale}
-            for p in result["points"]
-        ]
-        plant_sizes = [s * scale for s in result.get("plant_sizes", [])]
-
-        # Counting overlay
-        overlay = render_counting_overlay(base_img, points)
-        overlay_path = f"{job_dir}/counting_overlay.png"
-        overlay.save(overlay_path)
-        output_files.append("counting_overlay.png")
-
-        # Heatmap
-        heatmap_img = render_heatmap(result["heatmap"])
-        heatmap_path = f"{job_dir}/density_heatmap.png"
-        heatmap_img.save(heatmap_path)
-        output_files.append("density_heatmap.png")
-
-        if plant_sizes:
-            # Size annotated
-            annot = render_size_annotated(base_img, points, plant_sizes)
-            annot_path = f"{job_dir}/size_annotated.png"
-            annot.save(annot_path)
-            output_files.append("size_annotated.png")
-
-            # Color coded
-            color = render_size_color_coded(base_img, points, plant_sizes)
-            color_path = f"{job_dir}/size_color_coded.png"
-            color.save(color_path)
-            output_files.append("size_color_coded.png")
+        output_files = generate_all_visualizations(
+            job_id=job.id,
+            result=result,
+            heatmap=result["heatmap"],
+            image_path=job.input_params.get("image_path"),
+            temp_store=temp_store,
+        )
 
     # Store results (exclude large numpy arrays)
     result_serializable = {
@@ -145,6 +87,46 @@ def run_model_job(job: JobRecord) -> JobRecord:
         ]
 
     job.result = result_serializable
+    job.output_files = output_files
+    job.status = JobStatus.COMPLETED
+    job.completed_at = datetime.utcnow()
+    return job
+
+
+def post_process_hpc_job(job: JobRecord, results_dir: str) -> JobRecord:
+    """Post-process results downloaded from HPC.
+
+    Reads results.json + heatmap.npz from results_dir, then generates
+    visualizations locally using the original image on this server.
+    """
+    import json
+    import numpy as np
+
+    # Load HPC results
+    results_path = os.path.join(results_dir, "results.json")
+    with open(results_path, "r") as f:
+        result = json.load(f)
+
+    # Load compressed heatmap
+    heatmap = None
+    heatmap_path = os.path.join(results_dir, "heatmap.npz")
+    if os.path.exists(heatmap_path):
+        heatmap_data = np.load(heatmap_path)
+        heatmap = heatmap_data["heatmap"]
+
+    # Generate visualizations locally
+    output_files = []
+    if heatmap is not None and result.get("points"):
+        output_files = generate_all_visualizations(
+            job_id=job.id,
+            result=result,
+            heatmap=heatmap,
+            image_path=job.input_params.get("image_path"),
+            temp_store=temp_store,
+        )
+
+    # Store results
+    job.result = result
     job.output_files = output_files
     job.status = JobStatus.COMPLETED
     job.completed_at = datetime.utcnow()
@@ -174,8 +156,24 @@ async def lifespan(app: FastAPI):
     registry.discover()
     print(f"  Found {len(registry.list_models())} model(s)")
 
-    # Start job dispatcher
-    _dispatcher = InProcessQueue(worker_fn=run_model_job)
+    # Start job dispatcher based on compute_dispatch_mode
+    mode = settings.compute_dispatch_mode
+
+    if mode == "hpc":
+        from app.jobs.hpc_dispatcher import HPCDispatcher
+        _dispatcher = HPCDispatcher(post_process_fn=post_process_hpc_job)
+        print("Job dispatcher: HPC (Rustam2)")
+    elif mode == "auto":
+        from app.jobs.hpc_dispatcher import HPCDispatcher
+        from app.jobs.auto_dispatcher import AutoDispatcher
+        hpc_disp = HPCDispatcher(post_process_fn=post_process_hpc_job)
+        local_disp = InProcessQueue(worker_fn=run_model_job)
+        _dispatcher = AutoDispatcher(primary=hpc_disp, fallback=local_disp)
+        print("Job dispatcher: Auto (HPC with local fallback)")
+    else:  # "local" (default)
+        _dispatcher = InProcessQueue(worker_fn=run_model_job)
+        print("Job dispatcher: Local (InProcessQueue)")
+
     await _dispatcher.start()
     print("Job dispatcher started")
 

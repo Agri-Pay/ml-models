@@ -3,7 +3,7 @@ FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# System dependencies for rasterio/GDAL and opencv
+# System dependencies for rasterio/GDAL, opencv, and HPC SSH/SCP
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdal-dev \
     libgl1 \
     libglib2.0-0 \
+    sshpass \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Make python3.10 the default

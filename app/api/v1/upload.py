@@ -119,21 +119,34 @@ async def get_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Map internal tile progress (current/total) to 0-100 percentage
-    if job.progress_total and job.progress_total > 0:
-        pct = 10.0 + 85.0 * (job.progress_current / job.progress_total)
-    elif job.status == JobStatus.COMPLETED:
-        pct = 100.0
-    elif job.status == JobStatus.RUNNING:
-        pct = 10.0
+    # Map internal progress to 0-100 percentage
+    # HPC jobs use progress_current/progress_total directly (already 0-100 scale)
+    if job.dispatch_backend == "hpc":
+        if job.status == JobStatus.COMPLETED:
+            pct = 100.0
+        elif job.progress_current > 0:
+            pct = float(job.progress_current)
+        elif job.status == JobStatus.RUNNING:
+            pct = 10.0
+        else:
+            pct = 5.0
     else:
-        pct = 5.0
+        # Local mode: map tile progress (current/total) to 10-95 range
+        if job.progress_total and job.progress_total > 0:
+            pct = 10.0 + 85.0 * (job.progress_current / job.progress_total)
+        elif job.status == JobStatus.COMPLETED:
+            pct = 100.0
+        elif job.status == JobStatus.RUNNING:
+            pct = 10.0
+        else:
+            pct = 5.0
 
     response = {
         "job_id": job_id,
         "status": job.status.value,
         "progress": round(pct, 1),
         "message": job.progress_message or _status_message(job.status),
+        "dispatch_backend": job.dispatch_backend,
     }
 
     if job.status == JobStatus.COMPLETED and job.result:

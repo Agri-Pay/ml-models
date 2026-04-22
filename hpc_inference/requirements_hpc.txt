@@ -1,0 +1,10 @@
+# Minimal HPC dependencies for AgriPay inference
+# Install into the agripay conda environment on HPC
+# NOTE: torch and torchvision are installed by conda with CUDA support
+# in setup_hpc_env.sh. Do NOT list them here or pip will overwrite
+# the CUDA-enabled builds with CPU-only versions from PyPI.
+numpy>=1.24.0
+scipy>=1.11.0
+rasterio>=1.3.9
+Pillow>=10.0.0
+scikit-learn>=1.3.0

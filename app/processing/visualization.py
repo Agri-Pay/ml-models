@@ -1,10 +1,106 @@
 """Visualization utilities for plant counting results."""
 
+import os
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib
 import matplotlib.cm
+
+
+VIZ_MAX_DIM = 2048
+
+
+def generate_all_visualizations(
+    job_id: str,
+    result: Dict,
+    heatmap: np.ndarray,
+    image_path: Optional[str],
+    temp_store,
+) -> List[str]:
+    """Generate all visualization PNGs for a completed inference job.
+
+    Args:
+        job_id: The job ID (for temp_store directory)
+        result: Inference result dict (must have 'points', 'plant_sizes',
+                'image_width', 'image_height')
+        heatmap: The density heatmap as a numpy array
+        image_path: Path to the original image for overlays (may be None)
+        temp_store: TempResultStore instance
+
+    Returns:
+        List of output filenames
+    """
+    output_files = []
+    points_raw = result.get("points", [])
+    if not points_raw:
+        return output_files
+
+    job_dir = temp_store.get_job_dir(job_id)
+
+    # Disable PIL decompression bomb check — drone imagery is trusted and large
+    Image.MAX_IMAGE_PIXELS = None
+
+    W = result.get("image_width", 1024)
+    H = result.get("image_height", 1024)
+
+    # Load original image for overlays, capped at VIZ_MAX_DIM
+    scale = 1.0
+    if image_path and os.path.exists(image_path):
+        try:
+            base_img = Image.open(image_path).convert("RGB")
+            orig_w, orig_h = base_img.size
+            scale = min(1.0, VIZ_MAX_DIM / max(orig_w, orig_h))
+            if scale < 1.0:
+                viz_w = max(1, int(orig_w * scale))
+                viz_h = max(1, int(orig_h * scale))
+                base_img = base_img.resize((viz_w, viz_h), Image.LANCZOS)
+                print(f"  Viz: downsampled {orig_w}x{orig_h} -> {viz_w}x{viz_h} (scale={scale:.3f})")
+        except Exception as exc:
+            print(f"  Viz: could not open image ({exc}), using blank canvas")
+            scale = min(1.0, VIZ_MAX_DIM / max(W, H))
+            viz_w = max(1, int(W * scale))
+            viz_h = max(1, int(H * scale))
+            base_img = Image.new("RGB", (viz_w, viz_h), (40, 40, 40))
+    else:
+        scale = min(1.0, VIZ_MAX_DIM / max(W, H))
+        viz_w = max(1, int(W * scale))
+        viz_h = max(1, int(H * scale))
+        base_img = Image.new("RGB", (viz_w, viz_h), (40, 40, 40))
+
+    # Scale point coordinates and sizes to match visualization resolution
+    points = [
+        {
+            "x": int(p["x"] * scale),
+            "y": int(p["y"] * scale),
+            "base_sigma": p.get("base_sigma", 0) * scale,
+        }
+        for p in points_raw
+    ]
+    plant_sizes = [s * scale for s in result.get("plant_sizes", [])]
+
+    # Counting overlay
+    overlay = render_counting_overlay(base_img, points)
+    overlay.save(f"{job_dir}/counting_overlay.png")
+    output_files.append("counting_overlay.png")
+
+    # Heatmap
+    heatmap_img = render_heatmap(heatmap)
+    heatmap_img.save(f"{job_dir}/density_heatmap.png")
+    output_files.append("density_heatmap.png")
+
+    if plant_sizes:
+        # Size annotated
+        annot = render_size_annotated(base_img, points, plant_sizes)
+        annot.save(f"{job_dir}/size_annotated.png")
+        output_files.append("size_annotated.png")
+
+        # Color coded
+        color = render_size_color_coded(base_img, points, plant_sizes)
+        color.save(f"{job_dir}/size_color_coded.png")
+        output_files.append("size_color_coded.png")
+
+    return output_files
 
 
 def render_counting_overlay(
