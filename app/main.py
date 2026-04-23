@@ -19,6 +19,7 @@ from app.api.v1.health import router as health_root_router
 from app.api.v1 import jobs as jobs_api
 from app.api.v1 import analysis as analysis_api
 from app.api.v1 import upload as upload_api
+from app.api.v1 import analyze_upload as analyze_upload_api
 from app.models.registry import registry
 from app.jobs.models import JobRecord, JobStatus
 from app.jobs.in_process_queue import InProcessQueue
@@ -185,7 +186,10 @@ async def lifespan(app: FastAPI):
     jobs_api.set_dispatcher(_dispatcher)
     jobs_api.set_temp_store(temp_store)
     analysis_api.set_dispatcher(_dispatcher)
+    analysis_api.set_temp_store(temp_store)
     upload_api.set_dispatcher(_dispatcher)
+    analyze_upload_api.set_dispatcher(_dispatcher)
+    analyze_upload_api.set_temp_store(temp_store)
 
     # Periodic cleanup: remove expired job temp dirs every hour
     async def _periodic_temp_cleanup():
