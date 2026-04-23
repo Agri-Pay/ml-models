@@ -1,6 +1,6 @@
 # AgriPay Rustam2 Runbook
 
-Last updated: April 21, 2026
+Last updated: April 23, 2026
 
 ## Status: WORKING ✓
 
@@ -35,18 +35,19 @@ HOME is for small persistent files (up to ~10 GB). /scratch is for high-performa
 Four issues must be addressed for GPU jobs to work on this cluster:
 
 1. **Module system not auto-loaded in batch jobs** — must source `/etc/profile.d/modules.sh` manually
-2. **GRES: two separate `--gres` lines** — `gpu:v100:1` then `mps:400` (NOT combined with comma)
-3. **MPS value: 400** — admin confirmed working value (manual says <250, but 400 works)
-4. **No `-u` in set flags** — `set -eo pipefail` NOT `set -euo pipefail`; conda MKL activation scripts use unbound variables which `-u` treats as fatal errors
+2. **GRES: use `--gres=gpu:1` only** — MPS was turned OFF by admin (April 22, 2026). Single line, no mps line
+3. **No `-u` in set flags** — `set -eo pipefail` NOT `set -euo pipefail`; conda MKL activation scripts use unbound variables which `-u` treats as fatal errors
+4. **Resources: 8 CPUs, 48G mem** — admin recommended increase (previously 4 CPUs / 16G)
 
 ```bash
 #!/bin/bash
 #SBATCH --job-name=agripay_gpu_smoke
 #SBATCH --partition=debug
-#SBATCH --gres=gpu:v100:1
-#SBATCH --gres=mps:400
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
 #SBATCH --time=00:10:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
@@ -111,7 +112,8 @@ SUCCESS: GPU allocation and CUDA execution work under SLURM
 
 - **CUDA first-run is slow**: First forward pass through VGG model takes 3-10 minutes on the V100 due to CUDA kernel compilation. Subsequent tiles are fast. Accept 15-30 min time limit for first-run jobs.
 - **GPU contention under MPS**: If other users are running heavy GPU jobs, MPS shares the SM resources. Large images under high contention can be slow. The default 30-minute time limit in production should handle this.
-- **COMPLETING state hang**: After SLURM kills a job (timeout or cancel), the MPS daemon cleanup can get stuck in `COMPLETING` state for 30+ minutes. This holds the GPU resource allocation. If your job is stuck `PENDING (Resources)` for more than a few minutes, check `squeue --all` and look for a `COMPLETING` job. Ask admin (noumanz) to clean it up with `scontrol update JobId=<id> EndTime=now`.
+- **COMPLETING state hang**: After SLURM kills a job (timeout or cancel), the GPU cleanup can get stuck in `COMPLETING` state for 30+ minutes. This holds the GPU resource allocation. If your job is stuck `PENDING (Resources)` for more than a few minutes, check `squeue --all` and look for a `COMPLETING` job. Ask admin (noumanz) to clean it up with `scontrol update JobId=<id> EndTime=now`.
+- **"Priority" pending reason**: Means the GPU may free up soon but a higher-priority job is ahead of you in the queue. Different from "Resources" (GPU physically unavailable). Nothing wrong with your job — just wait or check if a COMPLETING job is blocking the chain.
 - **Python stdout buffering**: SLURM captures stdout to a file, and Python buffers it. Always set `export PYTHONUNBUFFERED=1` in SLURM scripts so output appears immediately.
 
 ## What Was Fixed (History)

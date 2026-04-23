@@ -1,20 +1,23 @@
-"""Drone imagery analyzer — runs ML model on latest drone image.
+"""Drone imagery analyzer — spectral band statistics for wheat verification.
 
-Finds the most recent drone image for a farm and runs the plant
-counting model to assess crop health.
+For wheat crops (no plant-counting model available), verification uses the
+statistical summary stored in `drone_imagery_layers.statistics` (populated at
+upload time by TiTiler). This avoids running any ML model while still extracting
+a meaningful greenness signal from the drone orthomosaic.
+
+No plant counting is performed. The previous rice_plant_counter_v1 dependency
+is removed entirely for wheat.
 """
 
-import asyncio
 from typing import Any, Dict, Optional
-from datetime import datetime, timedelta
-import os
-import logging
 
-from app.config import settings
 from app.db.supabase_client import get_supabase
-from app.models.registry import registry
+from app.verification.wheat_thresholds import get_thresholds, score_range
 
-logger = logging.getLogger(__name__)
+
+# Layer type preference order: NDVI layer is most informative, fall back to
+# multispectral, then RGB.
+_LAYER_PREFERENCE = ["ndvi", "multispectral", "rgb"]
 
 
 async def analyze_drone(
@@ -23,22 +26,30 @@ async def analyze_drone(
     milestone_type: str,
     crop_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Analyze drone imagery for milestone verification.
+    """Analyze drone imagery for wheat milestone verification.
 
-    Finds the latest drone image for the farm, runs the plant counting model,
-    and derives a confidence score based on plant count vs expectations.
+    Uses pre-computed band statistics stored in drone_imagery_layers.statistics
+    (a JSONB column populated when each GeoTIFF is uploaded). No ML model is run.
+
+    Args:
+        farm_id:        Farm UUID.
+        milestone_id:   Milestone UUID (kept for API compatibility).
+        milestone_type: Lowercase underscored milestone name.
+        crop_name:      Crop name (kept for API compatibility, not used here).
+
+    Returns:
+        dict with status, confidence, ndvi_mean (if available), flight_date,
+        layer_type, and interpretation.
     """
     try:
         supabase = get_supabase()
     except RuntimeError:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": "Database not configured",
-        }
+        return _no_data("Database not configured")
 
-    # Find the latest drone image for this farm
-    flights_response = (
+    # ------------------------------------------------------------------
+    # Find the most recent drone flight for this farm
+    # ------------------------------------------------------------------
+    flights_resp = (
         supabase.table("drone_flights")
         .select("id, flight_date")
         .eq("farm_id", farm_id)
@@ -47,244 +58,178 @@ async def analyze_drone(
         .execute()
     )
 
-    if not flights_response.data:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": "No drone flights found for this farm",
-        }
+    if not flights_resp.data:
+        return _no_data("No drone flights found for this farm")
 
-    flight = flights_response.data[0]
-    flight_id = flight["id"]
+    flight = flights_resp.data[0]
+    flight_id   = flight["id"]
+    flight_date = flight["flight_date"]
 
-    # Determine model based on crop type
-    if crop_name:
-        matching = registry.list_models(crop=crop_name)
-        model_id = matching[0].model_id if matching else "rice_plant_counter_v1"
-    else:
-        model_id = "rice_plant_counter_v1"
-    try:
-        cache_cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-        cached = (
-            supabase.table("ml_results")
-            .select("result_data, image_filename, processing_time_seconds, analyzed_at")
-            .eq("flight_id", flight_id)
-            .eq("model_id", model_id)
-            .gte("analyzed_at", cache_cutoff)
-            .order("analyzed_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if cached.data:
-            c = cached.data[0]
-            rd = c.get("result_data") or {}
-            plant_count = rd.get("total_count", 0)
-            avg_size = rd.get("average_size", rd.get("avg_size_px", 0.0)) or 0.0
-            confidence = _score_drone_result(milestone_type, plant_count, avg_size)
-            if confidence >= 0.8:
-                interp = f"Drone analysis strongly supports milestone (cached). {plant_count} plants (avg: {avg_size:.1f}px)"
-            elif confidence >= 0.5:
-                interp = f"Moderate drone evidence (cached). {plant_count} plants (avg: {avg_size:.1f}px)"
-            else:
-                interp = f"Weak drone evidence (cached). {plant_count} plants (avg: {avg_size:.1f}px)"
-            return {
-                "status": "ANALYZED",
-                "confidence": round(confidence, 3),
-                "interpretation": interp,
-                "plant_count": plant_count,
-                "avg_size_px": round(avg_size, 2),
-                "min_size_px": round(rd.get("min_size_px", 0), 2),
-                "max_size_px": round(rd.get("max_size_px", 0), 2),
-                "flight_date": flight["flight_date"],
-                "image_file": c.get("image_filename", ""),
-                "tiles_processed": rd.get("tiles_processed", 0),
-                "source": "cached",
-            }
-    except Exception:
-        pass  # Cache lookup failed — fall through to inference
-
-    # Find the image layer
-    layers_response = (
+    # ------------------------------------------------------------------
+    # Find the best available imagery layer for this flight
+    # Priority: ndvi → multispectral → rgb
+    # ------------------------------------------------------------------
+    layers_resp = (
         supabase.table("drone_imagery_layers")
-        .select("filename, layer_type")
+        .select("id, layer_type, statistics, filename")
         .eq("flight_id", flight_id)
-        .limit(1)
         .execute()
     )
 
-    if not layers_response.data:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": "No imagery layers found for the latest drone flight",
-        }
+    layers = layers_resp.data if layers_resp.data else []
+    if not layers:
+        return _no_data(
+            f"No imagery layers found for the latest drone flight ({flight_date})"
+        )
 
-    layer = layers_response.data[0]
-    filename = layer["filename"]
+    # Build a dict: layer_type → layer record
+    layer_by_type: Dict[str, Dict] = {}
+    for layer in layers:
+        lt = (layer.get("layer_type") or "").lower()
+        if lt not in layer_by_type:
+            layer_by_type[lt] = layer
 
-    # Construct image path — images are stored on the server disk
-    image_path = os.path.join(settings.imagery_dir, filename)
-    if not os.path.exists(image_path):
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": f"Drone image file not found on server: {filename}",
-        }
+    # Pick the best available layer type
+    chosen_layer = None
+    chosen_type  = None
+    for preferred in _LAYER_PREFERENCE:
+        if preferred in layer_by_type:
+            chosen_layer = layer_by_type[preferred]
+            chosen_type  = preferred
+            break
 
-    # Run plant counting model — via dispatcher (HPC/auto) or directly (local)
-    if settings.compute_dispatch_mode in ("hpc", "auto"):
-        result = await _run_via_dispatcher(model_id, image_path)
-        if result is None:
-            return {
-                "status": "NO_DATA",
-                "confidence": 0.0,
-                "interpretation": "Drone analysis failed: HPC dispatch error",
-            }
+    if chosen_layer is None:
+        # Fall back to any layer that has statistics
+        for layer in layers:
+            if layer.get("statistics"):
+                chosen_layer = layer
+                chosen_type  = (layer.get("layer_type") or "unknown").lower()
+                break
+
+    if chosen_layer is None:
+        return _no_data(
+            f"Drone imagery layers have no statistics JSONB for flight {flight_date}"
+        )
+
+    # ------------------------------------------------------------------
+    # Extract NDVI (or greenness proxy) from statistics
+    # ------------------------------------------------------------------
+    statistics = chosen_layer.get("statistics") or {}
+
+    ndvi_mean = _extract_ndvi_mean(statistics, chosen_type)
+
+    if ndvi_mean is None:
+        return _no_data(
+            f"Could not extract NDVI from {chosen_type} layer statistics "
+            f"(flight {flight_date}). Statistics field: {list(statistics.keys())}"
+        )
+
+    # ------------------------------------------------------------------
+    # Score against wheat milestone thresholds
+    # ------------------------------------------------------------------
+    thresholds  = get_thresholds(milestone_type)
+    drone_cfg   = thresholds.get("drone", {})
+
+    ndvi_opt = tuple(drone_cfg.get("ndvi_layer_optimal",    (0.10, 0.80)))
+    ndvi_acc = tuple(drone_cfg.get("ndvi_layer_acceptable", (0.02, 0.90)))
+
+    confidence = round(score_range(ndvi_mean, ndvi_opt, ndvi_acc), 3)
+
+    # ------------------------------------------------------------------
+    # Interpretation
+    # ------------------------------------------------------------------
+    if confidence >= 0.80:
+        verdict = "strongly supports"
+    elif confidence >= 0.55:
+        verdict = "moderately supports"
+    elif confidence > 0.25:
+        verdict = "weakly supports"
     else:
-        model = registry.get(model_id)
-        if model is None:
-            return {
-                "status": "NO_DATA",
-                "confidence": 0.0,
-                "interpretation": f"Plant counting model '{model_id}' not available",
-            }
+        verdict = "does not support"
 
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = registry.ensure_loaded(model_id, device=device)
-        result = model.predict(image_path)
-
-    plant_count = result.get("plant_count", 0)
-    avg_size = result.get("avg_size_px", 0.0)
-
-    # Derive confidence based on milestone type and plant count
-    confidence = _score_drone_result(milestone_type, plant_count, avg_size)
-
-    # Interpret
-    if confidence >= 0.8:
-        interpretation = f"Drone analysis strongly supports milestone. Detected {plant_count} plants (avg size: {avg_size:.1f}px)"
-    elif confidence >= 0.5:
-        interpretation = f"Moderate drone evidence. Detected {plant_count} plants (avg size: {avg_size:.1f}px)"
-    elif confidence > 0:
-        interpretation = f"Weak drone evidence. Detected {plant_count} plants (avg size: {avg_size:.1f}px)"
-    else:
-        interpretation = f"No drone evidence of milestone completion. Detected {plant_count} plants"
-
-    # Cache the freshly computed results in ml_results
-    try:
-        supabase.table("ml_results").insert({
-            "farm_id": farm_id,
-            "flight_id": flight_id,
-            "model_id": model_id,
-            "image_filename": filename,
-            "result_data": {
-                "total_count": plant_count,
-                "average_size": avg_size,
-                "min_size_px": result.get("min_size_px", 0),
-                "max_size_px": result.get("max_size_px", 0),
-                "tiles_processed": result.get("tiles_processed", 0),
-            },
-            "processing_time_seconds": result.get("processing_time_seconds"),
-            "analyzed_at": datetime.utcnow().isoformat(),
-        }).execute()
-    except Exception:
-        pass  # Non-critical
+    interpretation = (
+        f"Drone {chosen_type} layer {verdict} {milestone_type} milestone. "
+        f"NDVI mean={ndvi_mean:.3f} "
+        f"(expected {ndvi_opt[0]:.2f}–{ndvi_opt[1]:.2f}). "
+        f"Flight date: {flight_date}."
+    )
 
     return {
         "status": "ANALYZED",
-        "confidence": round(confidence, 3),
+        "confidence": confidence,
         "interpretation": interpretation,
-        "plant_count": plant_count,
-        "avg_size_px": round(avg_size, 2),
-        "min_size_px": round(result.get("min_size_px", 0), 2),
-        "max_size_px": round(result.get("max_size_px", 0), 2),
-        "flight_date": flight["flight_date"],
-        "image_file": filename,
-        "tiles_processed": result.get("tiles_processed", 0),
+        "ndvi_mean": round(ndvi_mean, 4),
+        "layer_type": chosen_type,
+        "flight_date": flight_date,
+        "filename": chosen_layer.get("filename", ""),
     }
 
 
-async def _run_via_dispatcher(model_id: str, image_path: str) -> Optional[Dict[str, Any]]:
-    """Submit an inference job through the global dispatcher and wait for results.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    Used when compute_dispatch_mode is "hpc" or "auto" to route inference
-    through the HPC cluster instead of running locally.
+def _extract_ndvi_mean(statistics: Dict, layer_type: str) -> Optional[float]:
+    """Extract a NDVI mean value from the statistics JSONB.
+
+    The structure of statistics depends on how TiTiler populated it at upload:
+    - Single-band layers: {"mean": 0.45, "min": ..., "max": ..., "std": ...}
+    - Multi-band layers:  {"1": {"mean": ...}, "2": {"mean": ...}, ...}
+                          or {"R": {"mean": ...}, "G": {"mean": ...}, ...}
+    - NDVI layer with a named band: {"ndvi": {"mean": ...}}
     """
-    from app.jobs.models import JobRecord, JobStatus
-
-    # Get the global dispatcher from main module
-    from app.main import _dispatcher
-    if _dispatcher is None:
-        logger.error("Dispatcher not initialized")
+    if not statistics:
         return None
 
-    job = JobRecord(
-        model_id=model_id,
-        input_params={"image_path": image_path},
-    )
+    # Direct mean at top level (single-band NDVI layer)
+    if "mean" in statistics:
+        val = statistics["mean"]
+        if val is not None:
+            return float(val)
 
-    try:
-        await _dispatcher.submit(job)
-    except Exception as e:
-        logger.error("Failed to submit job to dispatcher: %s", str(e))
-        return None
+    # Named key "ndvi" (some TiTiler outputs)
+    if "ndvi" in statistics:
+        sub = statistics["ndvi"]
+        if isinstance(sub, dict) and sub.get("mean") is not None:
+            return float(sub["mean"])
+        if isinstance(sub, (int, float)):
+            return float(sub)
 
-    # Poll until complete (with timeout)
-    timeout = settings.hpc_job_timeout_seconds
-    poll_interval = settings.hpc_poll_interval_seconds
-    elapsed = 0
+    # Multi-band: if it's an NDVI layer, band 1 is the NDVI channel
+    if layer_type in ("ndvi", "multispectral"):
+        for key in ("1", "band1", "Band1", "b1"):
+            if key in statistics:
+                sub = statistics[key]
+                if isinstance(sub, dict) and sub.get("mean") is not None:
+                    return float(sub["mean"])
 
-    while elapsed < timeout:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
+    # RGB layer fallback: compute crude NDVI proxy from red/green channels
+    # (R reflectance high → low NDVI, G high → healthy canopy indicator)
+    # This is a rough proxy only — used when no better layer exists.
+    if layer_type == "rgb":
+        r_mean = _band_mean(statistics, ("R", "red",   "1", "Band1"))
+        g_mean = _band_mean(statistics, ("G", "green", "2", "Band2"))
+        if r_mean is not None and g_mean is not None and (r_mean + g_mean) > 0:
+            # Simple green ratio index as NDVI proxy
+            return float((g_mean - r_mean) / (g_mean + r_mean))
 
-        status = await _dispatcher.get_status(job.id)
-        if status is None:
-            continue
-
-        if status.status == JobStatus.COMPLETED:
-            return status.result or {}
-        elif status.status == JobStatus.FAILED:
-            logger.error("Dispatcher job %s failed: %s", job.id, status.error)
-            return None
-
-    logger.error("Dispatcher job %s timed out after %ds", job.id, timeout)
     return None
 
 
-def _score_drone_result(
-    milestone_type: str,
-    plant_count: int,
-    avg_size: float,
-) -> float:
-    """Score confidence based on drone analysis results and milestone expectations."""
-    # Default expectations by milestone type
-    expectations = {
-        "planting": {"min_count": 100, "ideal_count": 500},
-        "fertilizer": {"min_count": 100, "ideal_count": 300},
-        "irrigation": {"min_count": 50, "ideal_count": 200},
-        "growth": {"min_count": 200, "ideal_count": 500},
-        "harvest": {"min_count": 0, "ideal_count": 50},  # Low count at harvest
+def _band_mean(statistics: Dict, keys) -> Optional[float]:
+    """Try multiple band name variants to find a mean value."""
+    for key in keys:
+        sub = statistics.get(key)
+        if isinstance(sub, dict) and sub.get("mean") is not None:
+            return float(sub["mean"])
+        if isinstance(sub, (int, float)):
+            return float(sub)
+    return None
+
+
+def _no_data(reason: str) -> Dict[str, Any]:
+    return {
+        "status": "NO_DATA",
+        "confidence": 0.0,
+        "interpretation": reason,
     }
-
-    exp = expectations.get(milestone_type, {"min_count": 100, "ideal_count": 500})
-
-    if milestone_type == "harvest":
-        # At harvest, fewer plants is expected
-        if plant_count <= exp["ideal_count"]:
-            return 1.0
-        elif plant_count <= exp["ideal_count"] * 3:
-            return 0.5
-        else:
-            return 0.2
-    else:
-        # For other milestones, more plants = better
-        if plant_count >= exp["ideal_count"]:
-            return 1.0
-        elif plant_count >= exp["min_count"]:
-            return 0.5 + 0.5 * (plant_count - exp["min_count"]) / (exp["ideal_count"] - exp["min_count"])
-        elif plant_count > 0:
-            return 0.3 * plant_count / exp["min_count"]
-        else:
-            return 0.0

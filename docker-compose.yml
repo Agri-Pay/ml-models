@@ -6,7 +6,7 @@ services:
     volumes:
       - ../frontends/titiler-local/imagery:/data
     environment:
-      - TITILER_CORS_ORIGINS=*
+      - TITILER_API_CORS_ORIGINS=*
 
   compute:
     build:

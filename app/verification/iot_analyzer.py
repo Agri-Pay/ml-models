@@ -1,156 +1,242 @@
-"""IoT sensor data analyzer — rule-based spike and trend detection.
+"""IoT sensor analyzer — per-sensor-type wheat milestone verification.
 
-Queries `iot_readings` for sensor data and performs statistical
-analysis to detect patterns relevant to milestone verification.
+Queries `iot_readings` grouped by sensor type and checks whether each sensor's
+readings fall within the agronomically expected range for the milestone being
+verified (Punjab Pakistan, Rabi season).
+
+Key fix over the previous version: readings from all sensor types are NO LONGER
+pooled into a single mixed array. Soil temperature and soil moisture — which
+have completely different units and scales — are now analyzed separately.
 """
 
+from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from app.db.supabase_client import get_supabase
+from app.verification.wheat_thresholds import get_thresholds, score_range
 
 
 async def analyze_iot(
     farm_id: str,
     milestone_type: str,
-    lookback_days: int = 14,
+    completion_date: Optional[str] = None,
+    lookback_days: int = 21,
 ) -> Dict[str, Any]:
-    """Analyze IoT sensor data for milestone verification.
+    """Analyze IoT sensor data for wheat milestone verification.
 
-    Queries iot_readings for the farm's devices, computes statistics,
-    and detects anomalies/spikes relevant to the milestone type.
+    Args:
+        farm_id:         Farm UUID.
+        milestone_type:  Lowercase underscored milestone name.
+        completion_date: ISO date string used to center the data window.
+        lookback_days:   Fallback window when completion_date is None.
+
+    Returns:
+        dict with status, confidence, per-sensor-type scores and means,
+        readings_per_sensor, and interpretation.
     """
     try:
         supabase = get_supabase()
     except RuntimeError:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": "Database not configured",
-            "readings_count": 0,
-        }
+        return _no_data("Database not configured", {})
 
-    # Find active IoT devices for this farm
-    devices_response = (
+    # ------------------------------------------------------------------
+    # Time window
+    # ------------------------------------------------------------------
+    thresholds = get_thresholds(milestone_type)
+    time_window = thresholds.get("time_window", {"before_days": 7, "after_days": 14})
+
+    if completion_date:
+        try:
+            base = datetime.fromisoformat(completion_date)
+        except ValueError:
+            base = datetime.utcnow()
+        window_start = (base - timedelta(days=time_window["before_days"])).isoformat()
+        window_end   = (base + timedelta(days=time_window["after_days"])).isoformat()
+    else:
+        now = datetime.utcnow()
+        window_end   = now.isoformat()
+        window_start = (now - timedelta(days=lookback_days)).isoformat()
+
+    # ------------------------------------------------------------------
+    # Fetch active devices WITH their sensor type name
+    # Join to iot_sensor_types via sensor_type_id
+    # ------------------------------------------------------------------
+    devices_resp = (
         supabase.table("iot_devices")
-        .select("id, sensor_type_id, display_name, config")
+        .select("id, sensor_type_id, iot_sensor_types(name, unit)")
         .eq("farm_id", farm_id)
         .eq("is_active", True)
         .execute()
     )
 
-    devices = devices_response.data if devices_response.data else []
+    devices = devices_resp.data if devices_resp.data else []
     if not devices:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": "No active IoT devices found for this farm",
-            "readings_count": 0,
-        }
+        return _no_data("No active IoT devices found for this farm", {})
 
-    # Query readings for all devices
-    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).isoformat()
-    device_ids = [d["id"] for d in devices]
+    # Build map: device_id → sensor_type_name
+    device_sensor_type: Dict[str, str] = {}
+    for device in devices:
+        sensor_type_info = device.get("iot_sensor_types") or {}
+        sensor_name = sensor_type_info.get("name") if isinstance(sensor_type_info, dict) else None
+        if sensor_name:
+            device_sensor_type[device["id"]] = sensor_name
 
+    # ------------------------------------------------------------------
+    # Fetch readings for all devices in the time window
+    # ------------------------------------------------------------------
     all_readings: List[Dict] = []
-    for device_id in device_ids:
-        response = (
+    for device in devices:
+        resp = (
             supabase.table("iot_readings")
             .select("device_id, captured_at, value, quality_flag")
-            .eq("device_id", device_id)
-            .gte("captured_at", cutoff)
+            .eq("device_id", device["id"])
+            .gte("captured_at", window_start)
+            .lte("captured_at", window_end)
             .eq("quality_flag", "normal")
             .order("captured_at")
             .execute()
         )
-        if response.data:
-            all_readings.extend(response.data)
+        if resp.data:
+            all_readings.extend(resp.data)
 
     if not all_readings:
-        return {
-            "status": "NO_DATA",
-            "confidence": 0.0,
-            "interpretation": f"No IoT readings in the last {lookback_days} days",
-            "readings_count": 0,
-        }
+        return _no_data(
+            f"No IoT readings in the window {window_start[:10]} to {window_end[:10]}",
+            {}
+        )
 
-    # Analyze readings
-    values = [r["value"] for r in all_readings]
-    values_arr = np.array(values, dtype=np.float64)
+    # ------------------------------------------------------------------
+    # Group readings by sensor type
+    # ------------------------------------------------------------------
+    sensor_values: Dict[str, List[float]] = defaultdict(list)
+    for reading in all_readings:
+        device_id = reading.get("device_id")
+        sensor_type = device_sensor_type.get(device_id)
+        if sensor_type and reading.get("value") is not None:
+            sensor_values[sensor_type].append(float(reading["value"]))
 
-    mean_val = float(np.mean(values_arr))
-    std_val = float(np.std(values_arr))
-    min_val = float(np.min(values_arr))
-    max_val = float(np.max(values_arr))
+    # ------------------------------------------------------------------
+    # Score each sensor type against wheat thresholds
+    # ------------------------------------------------------------------
+    iot_cfg = thresholds.get("iot", {})
+    sensor_scores: Dict[str, float] = {}
+    sensor_means: Dict[str, float] = {}
+    readings_per_sensor: Dict[str, int] = {}
+    skipped_sensors: List[str] = []
 
-    # Split into first half (baseline) and second half (recent)
-    mid = len(values_arr) // 2
-    if mid > 0:
-        baseline_mean = float(np.mean(values_arr[:mid]))
-        recent_mean = float(np.mean(values_arr[mid:]))
-        change_pct = ((recent_mean - baseline_mean) / (baseline_mean + 1e-6)) * 100
-    else:
-        baseline_mean = mean_val
-        recent_mean = mean_val
-        change_pct = 0.0
+    for sensor_type, values in sensor_values.items():
+        readings_per_sensor[sensor_type] = len(values)
 
-    # Detect spikes (values > baseline + 2*std)
-    threshold = baseline_mean + 2 * std_val if std_val > 0 else baseline_mean * 1.5
-    spikes = [v for v in values_arr if v > threshold]
-    spike_detected = len(spikes) > 0
+        if len(values) < 3:
+            # Too few readings for reliable statistics
+            skipped_sensors.append(sensor_type)
+            continue
 
-    # Score confidence based on milestone type
-    confidence = _score_iot_result(milestone_type, change_pct, spike_detected, len(all_readings))
+        mean_val = float(np.mean(values))
+        sensor_means[sensor_type] = round(mean_val, 3)
 
-    # Interpret
-    if confidence >= 0.8:
-        interpretation = f"IoT data strongly supports milestone. Change: {change_pct:+.1f}%, spikes: {len(spikes)}"
-    elif confidence >= 0.5:
-        interpretation = f"Moderate IoT evidence. Change: {change_pct:+.1f}%, spikes: {len(spikes)}"
-    elif confidence > 0:
-        interpretation = f"Weak IoT evidence. Change: {change_pct:+.1f}%, spikes: {len(spikes)}"
-    else:
-        interpretation = f"No IoT evidence of milestone activity. Change: {change_pct:+.1f}%"
+        # Check if we have threshold config for this sensor type
+        if sensor_type in iot_cfg:
+            sensor_thresholds = iot_cfg[sensor_type]
+            optimal    = sensor_thresholds.get("optimal")
+            acceptable = sensor_thresholds.get("acceptable")
+
+            if optimal and acceptable:
+                sensor_scores[sensor_type] = round(
+                    score_range(mean_val, tuple(optimal), tuple(acceptable)), 3
+                )
+        # Sensors not in the milestone's iot config are ignored (no penalty)
+
+    if not sensor_scores:
+        reason = (
+            "No scoreable IoT sensor types found for this milestone "
+            f"(devices report: {list(sensor_values.keys()) or 'none'})"
+        )
+        return _no_data(reason, readings_per_sensor)
+
+    # ------------------------------------------------------------------
+    # Aggregate: equal-weight average of available scored sensor types
+    # ------------------------------------------------------------------
+    confidence = round(
+        sum(sensor_scores.values()) / len(sensor_scores), 3
+    )
+
+    # ------------------------------------------------------------------
+    # Interpretation
+    # ------------------------------------------------------------------
+    interpretation = _build_interpretation(
+        milestone_type, confidence, sensor_scores, sensor_means,
+        skipped_sensors, iot_cfg
+    )
 
     return {
         "status": "ANALYZED",
-        "confidence": round(confidence, 3),
+        "confidence": confidence,
         "interpretation": interpretation,
-        "readings_count": len(all_readings),
-        "baseline_mean": round(baseline_mean, 2),
-        "recent_mean": round(recent_mean, 2),
-        "change_pct": round(change_pct, 1),
-        "spike_detected": spike_detected,
-        "spike_count": len(spikes),
-        "stats": {
-            "mean": round(mean_val, 2),
-            "std": round(std_val, 2),
-            "min": round(min_val, 2),
-            "max": round(max_val, 2),
-        },
+        "sensor_scores": sensor_scores,
+        "sensor_means":  sensor_means,
+        "readings_per_sensor": readings_per_sensor,
         "devices_queried": len(devices),
+        "skipped_sensors": skipped_sensors,
+        "query_window": {"start": window_start[:10], "end": window_end[:10]},
     }
 
 
-def _score_iot_result(
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _no_data(reason: str, readings_per_sensor: Dict) -> Dict[str, Any]:
+    return {
+        "status": "NO_DATA",
+        "confidence": 0.0,
+        "interpretation": reason,
+        "sensor_scores": {},
+        "sensor_means":  {},
+        "readings_per_sensor": readings_per_sensor,
+        "devices_queried": 0,
+    }
+
+
+def _build_interpretation(
     milestone_type: str,
-    change_pct: float,
-    spike_detected: bool,
-    readings_count: int,
-) -> float:
-    """Score confidence based on IoT data patterns."""
-    if readings_count < 5:
-        return 0.1  # Too few readings for meaningful analysis
+    confidence: float,
+    sensor_scores: Dict[str, float],
+    sensor_means: Dict[str, float],
+    skipped_sensors: List[str],
+    iot_cfg: Dict,
+) -> str:
+    if confidence >= 0.80:
+        verdict = "strongly supports"
+    elif confidence >= 0.55:
+        moderately = "moderately supports"
+        verdict = moderately
+    elif confidence > 0.25:
+        verdict = "weakly supports"
+    else:
+        verdict = "does not support"
 
-    scoring = {
-        "fertilizer": lambda: 0.9 if (spike_detected and change_pct > 15) else (0.6 if spike_detected else (0.3 if change_pct > 10 else 0.1)),
-        "irrigation": lambda: 0.9 if (spike_detected and change_pct > 10) else (0.6 if change_pct > 5 else 0.2),
-        "planting": lambda: 0.7 if abs(change_pct) < 20 else 0.4,
-        "growth": lambda: 0.8 if (change_pct > 5 and not spike_detected) else 0.4,
-        "harvest": lambda: 0.7 if change_pct < -10 else 0.3,
-    }
+    parts = [f"IoT data {verdict} the {milestone_type} milestone."]
 
-    scorer = scoring.get(milestone_type, lambda: 0.5 if change_pct > 5 else 0.3)
-    return scorer()
+    for sensor_type, score in sensor_scores.items():
+        mean = sensor_means.get(sensor_type)
+        cfg  = iot_cfg.get(sensor_type, {})
+        opt  = cfg.get("optimal")
+        unit = ""
+        if sensor_type == "soil_temperature":
+            unit = "°C"
+        elif sensor_type == "soil_moisture":
+            unit = "%"
+
+        mean_str  = f"{mean:.1f}{unit}" if mean is not None else "n/a"
+        range_str = f"{opt[0]}-{opt[1]}{unit}" if opt else "?"
+        badge     = "✓" if score >= 0.6 else "✗"
+        parts.append(f"{sensor_type}: {mean_str} (optimal {range_str}) {badge}")
+
+    if skipped_sensors:
+        parts.append(f"Skipped (too few readings): {', '.join(skipped_sensors)}.")
+
+    return " ".join(parts)

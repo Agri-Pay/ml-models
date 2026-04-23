@@ -1,9 +1,13 @@
 """AgriPay Compute Backend - FastAPI application."""
 
+import asyncio
+import logging
 import os
 import torch
 from contextlib import asynccontextmanager
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -183,10 +187,28 @@ async def lifespan(app: FastAPI):
     analysis_api.set_dispatcher(_dispatcher)
     upload_api.set_dispatcher(_dispatcher)
 
+    # Periodic cleanup: remove expired job temp dirs every hour
+    async def _periodic_temp_cleanup():
+        while True:
+            await asyncio.sleep(3600)  # 1 hour
+            try:
+                removed = temp_store.cleanup_expired()
+                if removed:
+                    logger.info("Periodic cleanup: removed %d expired job dir(s)", removed)
+            except Exception as exc:
+                logger.warning("Periodic temp cleanup error: %s", exc)
+
+    cleanup_task = asyncio.create_task(_periodic_temp_cleanup())
+
     yield
 
     # Shutdown
     print("Shutting down AgriPay Compute Backend")
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     await _dispatcher.stop()
     temp_store.cleanup_expired()
 

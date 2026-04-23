@@ -40,9 +40,9 @@ async def verify_milestone(request: VerifyMilestoneRequest):
             detail=result.get("error", "Unknown error"),
         )
 
-    # ── Auto-trigger oracle release on PASS ──────────────────────────────────
+    # ── Auto-trigger oracle release on MILESTONE_COMPLETE ────────────────────
     oracle_result = None
-    if result.get("verdict") == "PASS":
+    if result.get("verdict") == "MILESTONE_COMPLETE":
         try:
             oracle_result = await release_payment(
                 ReleaseRequest(milestone_id=request.milestone_id)

@@ -29,14 +29,13 @@ class Settings(BaseSettings):
     hpc_scratch_dir: str = "/scratch/muhammadtalha/agripay"
     hpc_conda_env: str = "agripay"
     hpc_slurm_partition: str = "debug"
-    hpc_slurm_time_limit: str = "00:30:00"
-    hpc_slurm_gpu_type: str = "v100"
-    hpc_slurm_mps: int = 400
-    hpc_slurm_cpus: int = 4
-    hpc_slurm_mem: str = "16G"
+    hpc_slurm_time_limit: str = "01:00:00"   # 1 hour: covers first-run CUDA kernel compile (~10min) + inference
+    hpc_slurm_cpus: int = 8
+    hpc_slurm_mem: str = "48G"
     hpc_max_concurrent_jobs: int = 3
     hpc_poll_interval_seconds: int = 10
-    hpc_job_timeout_seconds: int = 1800
+    hpc_job_timeout_seconds: int = 7200          # 2hr total wall-clock (submission → completion)
+    hpc_slurm_pending_timeout_seconds: int = 86400  # 24hr max wait in SLURM PENDING queue
     hpc_ssh_timeout_seconds: int = 30
 
     # CORS — comma-separated origins, empty = use defaults

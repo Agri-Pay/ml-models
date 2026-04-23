@@ -18,7 +18,7 @@ services:
     volumes:
       - /mnt/data/imagery:/data:ro  # Read-only: TiTiler only needs to read
     environment:
-      - TITILER_CORS_ORIGINS=*
+      - TITILER_API_CORS_ORIGINS=*
     healthcheck:
       # TiTiler image doesn't have curl — use Python's built-in urllib instead
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:80/healthz')\" || exit 1"]

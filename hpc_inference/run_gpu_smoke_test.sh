@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=agripay_gpu_smoke
 #SBATCH --partition=debug
-#SBATCH --gres=gpu:v100:1
-#SBATCH --gres=mps:400
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
 #SBATCH --time=00:10:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err

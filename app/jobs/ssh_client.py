@@ -144,17 +144,20 @@ class HPCSSHClient:
     async def scp_download(self, remote_path: str, local_path: str) -> None:
         """Download a file from the HPC.
 
-        Same strategy: subprocess for large files, asyncssh for small files.
+        Uses subprocess sshpass+scp when available to stream directly to disk
+        (avoids loading the file into Python/asyncssh memory — critical for
+        large outputs like heatmap.npz which can be several hundred MB).
+        Falls back to asyncssh when sshpass is not installed.
         """
         logger.info(
             "Downloading %s:%s -> %s",
             self._host, remote_path, local_path,
         )
 
-        # We don't know remote file size, so try asyncssh first.
-        # For the typical HPC output (results.json ~few KB, heatmap.npz ~10-40 MB),
-        # asyncssh is fine. We only use subprocess for known large files.
-        await self._scp_download_asyncssh(remote_path, local_path)
+        if shutil.which("sshpass"):
+            await self._scp_download_subprocess(remote_path, local_path)
+        else:
+            await self._scp_download_asyncssh(remote_path, local_path)
 
         logger.info("Download complete: %s", local_path)
 
@@ -188,10 +191,11 @@ class HPCSSHClient:
         """Upload using subprocess sshpass+scp for large files.
 
         This avoids loading multi-GB files into Python memory.
+        Uses SSHPASS env var (not -p flag) to keep password out of the process list.
         """
         remote_target = f"{self._username}@{self._host}:{remote_path}"
         cmd = [
-            "sshpass", "-p", self._password,
+            "sshpass", "-e",
             "scp",
             "-P", str(self._port),
             "-o", "StrictHostKeyChecking=no",
@@ -199,11 +203,13 @@ class HPCSSHClient:
             local_path,
             remote_target,
         ]
+        env = {**os.environ, "SSHPASS": self._password}
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         stdout, stderr = await proc.communicate()
 
@@ -214,11 +220,15 @@ class HPCSSHClient:
             )
 
     async def _scp_download_subprocess(self, remote_path: str, local_path: str) -> None:
-        """Download using subprocess sshpass+scp for large files."""
+        """Download using subprocess sshpass+scp.
+
+        Streams directly to disk — safe for large files (e.g. 364MB heatmap.npz).
+        Uses SSHPASS env var to keep password out of the process list.
+        """
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         remote_source = f"{self._username}@{self._host}:{remote_path}"
         cmd = [
-            "sshpass", "-p", self._password,
+            "sshpass", "-e",
             "scp",
             "-P", str(self._port),
             "-o", "StrictHostKeyChecking=no",
@@ -226,11 +236,13 @@ class HPCSSHClient:
             remote_source,
             local_path,
         ]
+        env = {**os.environ, "SSHPASS": self._password}
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         stdout, stderr = await proc.communicate()
 

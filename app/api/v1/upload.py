@@ -1,7 +1,7 @@
 """Browser-facing upload/status/download compatibility API.
 
 Provides the same three paths the frontend already uses:
-  POST /upload              — receive an image file, start a job
+  POST /upload              — receive an image file OR image_url, start a job
   GET  /status/{job_id}    — poll job progress in the shape the frontend expects
   GET  /download/{job_id}/{file_type} — stream a result image
 
@@ -9,11 +9,15 @@ This is a thin layer over the existing /api/v1/jobs system.
 """
 
 import os
+import re
 import shutil
+from typing import Optional
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+import httpx
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from app.config import settings
 from app.jobs.models import JobRecord, JobStatus
 from app.storage.temp_results import temp_store
 
@@ -39,14 +43,100 @@ _FILE_TYPE_MAP = {
 # Max upload size: 10 GB
 _MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 
+# Content-types that are valid images (includes octet-stream for browsers that
+# don't know TIFF MIME type, and empty content-type for some file-pickers)
+_ALLOWED_IMAGE_TYPES = {"image/", "application/octet-stream"}
+
+# Google Drive URL patterns — used to resolve file IDs from share links
+_GDRIVE_HOST_RE = re.compile(r"(drive|docs)\.google\.com", re.IGNORECASE)
+_GDRIVE_FILE_RE = re.compile(r"/file/d/([a-zA-Z0-9_-]+)")
+_GDRIVE_ID_QS_RE = re.compile(r"[?&]id=([a-zA-Z0-9_-]+)")
+
+
+def _is_allowed_content_type(ct: Optional[str]) -> bool:
+    """Return True if the content-type looks like an image or binary blob."""
+    if not ct:
+        return True  # no content-type sent — trust the extension
+    for allowed in _ALLOWED_IMAGE_TYPES:
+        if ct.startswith(allowed):
+            return True
+    return False
+
+
+def _resolve_drive_download_url(url: str) -> tuple[str, str]:
+    """Convert a Google Drive share URL into a direct-download URL + filename hint.
+
+    Uses the Drive API key from settings (same key used by google_drive.py).
+    Returns (download_url, filename_hint).
+    """
+    m = _GDRIVE_FILE_RE.search(url)
+    if not m:
+        m = _GDRIVE_ID_QS_RE.search(url)
+        if not m:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not extract a file ID from the Google Drive URL. "
+                    "Please use a direct file link (e.g. drive.google.com/file/d/…), "
+                    "not a folder link."
+                ),
+            )
+    file_id = m.group(1)
+    api_key = settings.google_drive_api_key
+    if api_key:
+        # Use the Drive API for reliable large-file downloads (no virus-scan warning page)
+        dl_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key={api_key}"
+    else:
+        # Fallback: public uc export (works for small publicly-shared files)
+        dl_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+    return dl_url, "drive_image.tif"
+
+
+def _resolve_url(image_url: str) -> tuple[str, str]:
+    """Map any image_url to a (download_url, filename_hint) pair."""
+    if _GDRIVE_HOST_RE.search(image_url):
+        return _resolve_drive_download_url(image_url)
+    # Plain HTTPS URL — use as-is; derive filename from path segment
+    path = image_url.split("?")[0].rstrip("/")
+    name = path.split("/")[-1]
+    filename = name if "." in name else "input.tif"
+    return image_url, filename
+
+
+async def _stream_download(dl_url: str, local_path: str) -> None:
+    """Stream-download dl_url to local_path without loading it into memory."""
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(30.0, read=3600.0),
+    ) as client:
+        async with client.stream("GET", dl_url) as resp:
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Remote server returned HTTP {resp.status_code} while downloading the image.",
+                )
+            with open(local_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    f.write(chunk)
+
 
 # ---------------------------------------------------------------------------
 # POST /upload
 # ---------------------------------------------------------------------------
 
 @router.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
-    """Accept a browser image upload, persist it, and start a processing job.
+async def upload_image(
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+    model_id: str = Form("wheat_plant_counter_v1"),
+):
+    """Accept an image upload (file or Drive/HTTPS URL) and start a processing job.
+
+    Either `file` (multipart) or `image_url` (form field) must be provided.
+    image_url supports:
+      - Google Drive share links  (drive.google.com/file/d/…)
+      - Any public HTTPS image URL
 
     Returns:
         {job_id, status, progress, message}
@@ -54,50 +144,77 @@ async def upload_image(file: UploadFile = File(...)):
     if _dispatcher is None:
         raise HTTPException(status_code=503, detail="Dispatcher not ready")
 
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    if not file and not image_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either a file upload or an image_url.",
+        )
 
-    # Create a job record first so we know the job_id for the temp dir
-    job = JobRecord(
-        model_id="wheat_plant_counter_v1",
-        input_params={},  # image_path set below after we know job_id
-    )
-
-    # Save upload inside the job's temp directory
+    job = JobRecord(model_id=model_id, input_params={})
     job_dir = temp_store.get_job_dir(job.id)
-    ext = os.path.splitext(file.filename or "image.jpg")[1] or ".jpg"
-    upload_path = os.path.join(job_dir, f"input{ext}")
 
-    total = 0
-    try:
-        with open(upload_path, "wb") as dst:
-            while True:
-                chunk = await file.read(1024 * 1024)  # 1 MB chunks
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_FILE_BYTES:
-                    dst.close()
-                    os.remove(upload_path)
-                    raise HTTPException(status_code=413, detail=f"File too large (max {_MAX_FILE_BYTES // (1024*1024*1024)} GB)")
-                dst.write(chunk)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to save upload: {exc}")
+    # --- Path A: URL download (Google Drive or direct HTTPS) ---
+    if image_url:
+        dl_url, filename_hint = _resolve_url(image_url)
+        upload_path = os.path.join(job_dir, filename_hint)
+        try:
+            await _stream_download(dl_url, upload_path)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to download image: {exc}")
 
-    # Patch the job's input params with the saved path
-    job.input_params["image_path"] = upload_path
-    job.input_params["original_filename"] = file.filename or "upload"
+        if not os.path.exists(upload_path) or os.path.getsize(upload_path) == 0:
+            raise HTTPException(status_code=502, detail="Downloaded file was empty.")
 
-    # Submit to queue
+        job.input_params["image_path"] = upload_path
+        job.input_params["original_filename"] = filename_hint
+        message = "Image fetched from URL, processing started"
+
+    # --- Path B: direct browser file upload ---
+    else:
+        if not _is_allowed_content_type(file.content_type):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported file type '{file.content_type}'. "
+                    "Please upload a PNG, TIFF, or JPEG image."
+                ),
+            )
+
+        ext = os.path.splitext(file.filename or "image.tif")[1].lower() or ".tif"
+        upload_path = os.path.join(job_dir, f"input{ext}")
+        total = 0
+        try:
+            with open(upload_path, "wb") as dst:
+                while True:
+                    chunk = await file.read(1024 * 1024)  # 1 MB chunks
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_FILE_BYTES:
+                        dst.close()
+                        os.remove(upload_path)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large (max {_MAX_FILE_BYTES // (1024 * 1024 * 1024)} GB)",
+                        )
+                    dst.write(chunk)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to save upload: {exc}")
+
+        job.input_params["image_path"] = upload_path
+        job.input_params["original_filename"] = file.filename or "upload"
+        message = "Upload received, processing started"
+
     await _dispatcher.submit(job)
-
     return {
         "job_id": job.id,
         "status": "pending",
         "progress": 5.0,
-        "message": "Upload received, processing started",
+        "message": message,
     }
 
 

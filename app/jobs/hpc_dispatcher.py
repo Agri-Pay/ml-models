@@ -50,8 +50,9 @@ def _generate_slurm_script(job_id: str, hpc_job_dir: str) -> str:
     return f"""#!/bin/bash
 #SBATCH --job-name=agripay_{job_id_short}
 #SBATCH --partition={settings.hpc_slurm_partition}
-#SBATCH --gres=gpu:{settings.hpc_slurm_gpu_type}:1
-#SBATCH --gres=mps:{settings.hpc_slurm_mps}
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task={settings.hpc_slurm_cpus}
 #SBATCH --mem={settings.hpc_slurm_mem}
 #SBATCH --time={settings.hpc_slurm_time_limit}
@@ -98,8 +99,11 @@ class HPCDispatcher(JobDispatcher):
         self._poll_task: Optional[asyncio.Task] = None
         self._submit_task: Optional[asyncio.Task] = None
         self._running = False
-        # Track submission wall-clock time for timeout detection
+        # Track wall-clock times for timeout detection
+        # _job_start_times: when dispatcher submission began (for total-job timeout)
+        # _job_pending_times: when SLURM accepted the job (for PENDING-specific timeout)
         self._job_start_times: Dict[str, float] = {}
+        self._job_pending_times: Dict[str, float] = {}
 
     async def submit(self, job: JobRecord) -> str:
         """Submit a job for HPC processing. Returns job_id."""
@@ -243,6 +247,7 @@ class HPCDispatcher(JobDispatcher):
             self._slurm_to_job[slurm_job_id] = job_id
             self._active_slurm_ids.append(slurm_job_id)
             self._job_start_times[job_id] = time.time()
+            self._job_pending_times[job_id] = time.time()  # start PENDING clock
 
             job.progress_message = f"SLURM job {slurm_job_id} submitted, waiting in queue..."
             logger.info(
@@ -315,8 +320,13 @@ class HPCDispatcher(JobDispatcher):
                     if mapped_status == JobStatus.RUNNING:
                         job.progress_message = "Running on HPC (GPU)..."
                         job.progress_current = 50
+                        # Job has started running — reset the pending clock
+                        self._job_pending_times.pop(job_id, None)
                     elif mapped_status == JobStatus.PENDING:
-                        job.progress_message = f"SLURM job {sacct_job_id} queued..."
+                        pending_secs = int(time.time() - self._job_pending_times.get(job_id, time.time()))
+                        pending_hrs = pending_secs // 3600
+                        pending_mins = (pending_secs % 3600) // 60
+                        job.progress_message = f"SLURM job {sacct_job_id} queued ({pending_hrs}h {pending_mins}m)..."
                         job.progress_current = 10
 
                     # Handle completion
@@ -338,21 +348,47 @@ class HPCDispatcher(JobDispatcher):
                 logger.error("Polling loop error: %s", str(e))
 
     def _check_timeouts(self) -> None:
-        """Check if any active jobs have exceeded the timeout."""
+        """Check if any active jobs have exceeded their timeout.
+
+        Two independent timeouts apply:
+        - hpc_job_timeout_seconds: total wall-clock time from dispatcher submission.
+          Guards against jobs that run but never complete.
+        - hpc_slurm_pending_timeout_seconds: time spent in SLURM PENDING state.
+          Guards against jobs stuck in queue indefinitely (other users, node issues).
+          Defaults to 86400s (24 hours).
+        """
         now = time.time()
+        total_timeout = settings.hpc_job_timeout_seconds
+        pending_timeout = settings.hpc_slurm_pending_timeout_seconds
         timed_out = []
+
         for slurm_id in self._active_slurm_ids:
             job_id = self._slurm_to_job.get(slurm_id)
-            if job_id and job_id in self._job_start_times:
-                elapsed = now - self._job_start_times[job_id]
-                if elapsed > settings.hpc_job_timeout_seconds:
-                    timed_out.append((slurm_id, job_id))
+            if not job_id:
+                continue
 
-        for slurm_id, job_id in timed_out:
-            logger.warning("Job %s (SLURM %s) timed out", job_id, slurm_id)
-            asyncio.create_task(self._handle_timeout(job_id, slurm_id))
+            # Check total job timeout
+            if job_id in self._job_start_times:
+                total_elapsed = now - self._job_start_times[job_id]
+                if total_elapsed > total_timeout:
+                    timed_out.append((slurm_id, job_id, f"Job timed out after {total_timeout}s total"))
+                    continue
 
-    async def _handle_timeout(self, job_id: str, slurm_job_id: str) -> None:
+            # Check PENDING-specific timeout (only if still in pending clock)
+            if job_id in self._job_pending_times:
+                pending_elapsed = now - self._job_pending_times[job_id]
+                if pending_elapsed > pending_timeout:
+                    pending_hrs = int(pending_elapsed // 3600)
+                    timed_out.append((
+                        slurm_id, job_id,
+                        f"Job stuck in SLURM PENDING for {pending_hrs}h — cancelled (max {pending_timeout//3600}h)",
+                    ))
+
+        for slurm_id, job_id, reason in timed_out:
+            logger.warning("Job %s (SLURM %s): %s", job_id, slurm_id, reason)
+            asyncio.create_task(self._handle_timeout(job_id, slurm_id, reason))
+
+    async def _handle_timeout(self, job_id: str, slurm_job_id: str, reason: str = "") -> None:
         """Cancel a timed-out SLURM job and mark it failed."""
         try:
             await self._ssh.run_command(f"scancel {slurm_job_id}", timeout=10)
@@ -361,7 +397,7 @@ class HPCDispatcher(JobDispatcher):
 
         await self._handle_job_failed(
             job_id, slurm_job_id,
-            f"Job timed out after {settings.hpc_job_timeout_seconds}s"
+            reason or f"Job timed out after {settings.hpc_job_timeout_seconds}s",
         )
 
     @staticmethod
@@ -456,6 +492,7 @@ class HPCDispatcher(JobDispatcher):
             except Exception as e:
                 logger.warning("HPC cleanup failed for %s: %s", job_id, str(e))
 
+            self._job_pending_times.pop(job_id, None)
             self._cleanup_tracking(slurm_job_id, job_id)
 
     async def _handle_job_failed(
@@ -490,6 +527,7 @@ class HPCDispatcher(JobDispatcher):
         except Exception:
             pass
 
+        self._job_pending_times.pop(job_id, None)
         self._cleanup_tracking(slurm_job_id, job_id)
 
     def _cleanup_tracking(self, slurm_job_id: str, job_id: str) -> None:
