@@ -9,8 +9,7 @@ from app.api.v1.verification import router as verification_router
 from app.api.v1.upload import router as upload_router
 from app.api.v1.imagery import router as imagery_router
 from app.api.v1.chunked_upload import router as chunked_upload_router
-from app.api.v1.google_drive import router as google_drive_router, analyze_router as analyze_drive_router
-from app.api.v1.analyze_upload import router as analyze_upload_router
+from app.api.v1.google_drive import router as google_drive_router
 from app.api.v1.oracle import router as oracle_router
 
 v1_router = APIRouter(prefix="/api/v1")
@@ -22,8 +21,6 @@ v1_router.include_router(verification_router, tags=["verification"])
 v1_router.include_router(imagery_router)
 v1_router.include_router(chunked_upload_router)
 v1_router.include_router(google_drive_router)
-v1_router.include_router(analyze_drive_router)   # Plant Counter Drive resolver
-v1_router.include_router(analyze_upload_router)  # Plant Counter chunked upload
 v1_router.include_router(oracle_router)
 
 # Compatibility shim — mounts /upload, /status/{id}, /download/{id}/{type} at root

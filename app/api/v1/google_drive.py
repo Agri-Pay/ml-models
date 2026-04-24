@@ -198,109 +198,13 @@ async def _drive_list_folder(folder_id: str, api_key: str) -> list[dict]:
     return all_files
 
 
-VALID_IMAGE_EXTENSIONS_FOR_ANALYSIS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
-
-
 def _is_geotiff(f: dict) -> bool:
     name = f.get("name", "").lower()
     return name.endswith(".tif") or name.endswith(".tiff") or f.get("mimeType") == "image/tiff"
 
 
-def _is_supported_image(f: dict) -> bool:
-    """Accept any image format supported by the Plant Counter model."""
-    name = f.get("name", "").lower()
-    return any(name.endswith(ext) for ext in VALID_IMAGE_EXTENSIONS_FOR_ANALYSIS)
-
-
 # ---------------------------------------------------------------------------
-# Separate router for Plant Counter drive helpers (no GeoTIFF-only filter)
-# ---------------------------------------------------------------------------
-
-analyze_router = APIRouter(prefix="/analyze/drive", tags=["analyze-drive"])
-
-
-class AnalyzeDriveListRequest(BaseModel):
-    input: str  # Any Google Drive URL, folder URL, file URL, or raw ID
-
-
-@analyze_router.post("/list-files")
-async def list_files_for_analysis(req: AnalyzeDriveListRequest):
-    """Resolve a Drive URL/ID to an image file list for Plant Counter.
-
-    Unlike /imagery/drive/list-files this does NOT filter to GeoTIFF only —
-    it accepts .tif, .tiff, .png, .jpg, .jpeg so that Plant Counter can work
-    on regular aerial/field photos in addition to GeoTIFFs.
-
-    The drone imagery list-files endpoint is unchanged and unaffected.
-    """
-    api_key = _get_api_key()
-    kind, drive_id = _parse_drive_input(req.input)
-
-    files: list[dict] = []
-    resolved_type = kind
-
-    if kind == "file":
-        info = await _drive_get_file_info(drive_id, api_key)
-        if info is None:
-            raise HTTPException(
-                status_code=404,
-                detail="File not found on Google Drive. Check the URL or ID.",
-            )
-        files = [info]
-        resolved_type = "file"
-
-    elif kind == "folder":
-        files = await _drive_list_folder(drive_id, api_key)
-        resolved_type = "folder"
-
-    else:
-        # Unknown — try file first, then folder
-        info = await _drive_get_file_info(drive_id, api_key)
-        if info is not None:
-            files = [info]
-            resolved_type = "file"
-        else:
-            try:
-                files = await _drive_list_folder(drive_id, api_key)
-                resolved_type = "folder"
-            except HTTPException:
-                raise HTTPException(
-                    status_code=404,
-                    detail=(
-                        "Could not find a file or folder with this ID on Google Drive. "
-                        "Make sure the link is correct and the content is shared publicly."
-                    ),
-                )
-
-    image_files = [f for f in files if _is_supported_image(f)]
-    skipped = len(files) - len(image_files)
-
-    if not image_files:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "No compatible image files found at that Drive link. "
-                "Supported formats: .tif, .tiff, .png, .jpg, .jpeg"
-            ),
-        )
-
-    return {
-        "type": resolved_type,
-        "files": [
-            {
-                "id": f["id"],
-                "name": f["name"],
-                "size": int(f.get("size", 0)),
-                "mimeType": f.get("mimeType", ""),
-            }
-            for f in image_files
-        ],
-        "skipped_count": skipped,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Endpoints (drone imagery — GeoTIFF only, unchanged)
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/list-files")
