@@ -17,7 +17,7 @@ import tempfile
 import time
 import traceback
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from app.config import settings
 from app.jobs.dispatcher import JobDispatcher
@@ -94,6 +94,7 @@ class HPCDispatcher(JobDispatcher):
         self._jobs: Dict[str, JobRecord] = {}
         self._slurm_to_job: Dict[str, str] = {}  # slurm_job_id → job_id
         self._active_slurm_ids: List[str] = []    # currently active SLURM jobs
+        self._finalizing_slurm_ids: Set[str] = set()  # jobs already in completion/failure handling
         self._submit_semaphore: Optional[asyncio.Semaphore] = None
         self._submit_queue: asyncio.Queue[str] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
@@ -172,7 +173,26 @@ class HPCDispatcher(JobDispatcher):
             job.status = JobStatus.RUNNING
             job.started_at = datetime.utcnow()
 
+            if job.input_params.get("awaiting_download"):
+                deadline = time.time() + 3600
+                while job.input_params.get("awaiting_download") and time.time() < deadline:
+                    job.progress_message = "Downloading image from Google Drive..."
+                    job.progress_current = 1
+                    job.progress_total = 100
+                    await asyncio.sleep(1)
+                if job.status == JobStatus.FAILED:
+                    self._submit_semaphore.release()
+                    return
+                if job.input_params.get("awaiting_download"):
+                    job.status = JobStatus.FAILED
+                    job.error = "Timed out while downloading image from Google Drive"
+                    job.completed_at = datetime.utcnow()
+                    self._submit_semaphore.release()
+                    return
+
             image_path = job.input_params.get("image_path", "")
+            if not image_path:
+                raise RuntimeError("No image_path available after waiting for download")
             image_filename = os.path.basename(image_path)
             hpc_job_dir = f"{settings.hpc_scratch_dir}/{job_id}"
 
@@ -276,9 +296,16 @@ class HPCDispatcher(JobDispatcher):
                 self._check_timeouts()
 
                 # Query SLURM for all active job states in a single SSH call
-                slurm_ids_str = ",".join(self._active_slurm_ids)
+                pollable_slurm_ids = [
+                    sid for sid in self._active_slurm_ids
+                    if sid not in self._finalizing_slurm_ids
+                ]
+                if not pollable_slurm_ids:
+                    continue
+
+                slurm_ids_str = ",".join(pollable_slurm_ids)
                 stdout, stderr, exit_code = await self._ssh.run_command(
-                    f"sacct -j {slurm_ids_str} --format=JobID,State --noheader --parsable2",
+                    f"sacct -j {slurm_ids_str} --format=JobID,State,ExitCode --noheader --parsable2",
                     timeout=15,
                 )
 
@@ -331,12 +358,14 @@ class HPCDispatcher(JobDispatcher):
 
                     # Handle completion
                     if mapped_status == JobStatus.COMPLETED:
+                        self._finalizing_slurm_ids.add(sacct_job_id)
                         asyncio.create_task(
                             self._handle_job_completed(job_id, sacct_job_id)
                         )
 
                     # Handle failure
                     elif mapped_status == JobStatus.FAILED:
+                        self._finalizing_slurm_ids.add(sacct_job_id)
                         error_detail = self._slurm_error_detail(slurm_state)
                         asyncio.create_task(
                             self._handle_job_failed(job_id, sacct_job_id, error_detail)
@@ -363,6 +392,8 @@ class HPCDispatcher(JobDispatcher):
         timed_out = []
 
         for slurm_id in self._active_slurm_ids:
+            if slurm_id in self._finalizing_slurm_ids:
+                continue
             job_id = self._slurm_to_job.get(slurm_id)
             if not job_id:
                 continue
@@ -386,6 +417,7 @@ class HPCDispatcher(JobDispatcher):
 
         for slurm_id, job_id, reason in timed_out:
             logger.warning("Job %s (SLURM %s): %s", job_id, slurm_id, reason)
+            self._finalizing_slurm_ids.add(slurm_id)
             asyncio.create_task(self._handle_timeout(job_id, slurm_id, reason))
 
     async def _handle_timeout(self, job_id: str, slurm_job_id: str, reason: str = "") -> None:
@@ -416,6 +448,32 @@ class HPCDispatcher(JobDispatcher):
 
     # --- Completion handling ---
 
+    async def _hpc_diagnostics(self, hpc_job_dir: str, slurm_job_id: str) -> str:
+        """Collect concise diagnostics before scratch cleanup."""
+        commands = [
+            ("SLURM state", f"sacct -j {slurm_job_id} --format=JobID,State,ExitCode,Elapsed --noheader --parsable2"),
+            ("Outputs directory", f"ls -la {hpc_job_dir}/outputs 2>/dev/null || true"),
+            ("status.json", f"cat {hpc_job_dir}/outputs/status.json 2>/dev/null || true"),
+            ("SLURM stdout", f"cat {hpc_job_dir}/slurm_*.out 2>/dev/null | tail -80 || true"),
+            ("SLURM stderr", f"cat {hpc_job_dir}/slurm_*.err 2>/dev/null | tail -80 || true"),
+        ]
+        sections = []
+        for title, cmd in commands:
+            try:
+                stdout, stderr, _ = await self._ssh.run_command(cmd, timeout=15)
+                text = (stdout or stderr or "").strip()
+            except Exception as exc:
+                text = f"Could not collect diagnostics: {exc}"
+            if text:
+                sections.append(f"{title}:\n{text}")
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _set_failed(job: JobRecord, error_detail: str) -> None:
+        job.status = JobStatus.FAILED
+        job.error = error_detail
+        job.completed_at = datetime.utcnow()
+
     async def _handle_job_completed(self, job_id: str, slurm_job_id: str) -> None:
         """Download results from HPC, run local post-processing, cleanup."""
         job = self._jobs.get(job_id)
@@ -444,8 +502,11 @@ class HPCDispatcher(JobDispatcher):
 
                 if status_data.get("status") == "failed":
                     error_msg = status_data.get("error", "Unknown inference error")
-                    await self._handle_job_failed(
-                        job_id, slurm_job_id, f"Inference failed: {error_msg}"
+                    diagnostics = await self._hpc_diagnostics(hpc_job_dir, slurm_job_id)
+                    self._set_failed(
+                        job,
+                        f"Inference failed: {error_msg}"
+                        + (f"\n\n{diagnostics}" if diagnostics else ""),
                     )
                     return
             except Exception as e:
@@ -453,6 +514,15 @@ class HPCDispatcher(JobDispatcher):
                 # Continue — results.json might still be there
 
             # Step 2: Download results.json
+            if not await self._ssh.file_exists(f"{hpc_job_dir}/outputs/results.json"):
+                diagnostics = await self._hpc_diagnostics(hpc_job_dir, slurm_job_id)
+                self._set_failed(
+                    job,
+                    "HPC job completed but did not produce outputs/results.json."
+                    + (f"\n\n{diagnostics}" if diagnostics else ""),
+                )
+                return
+
             await self._ssh.scp_download(
                 f"{hpc_job_dir}/outputs/results.json",
                 os.path.join(local_results_dir, "results.json"),
@@ -480,9 +550,12 @@ class HPCDispatcher(JobDispatcher):
             logger.info("Job %s completed successfully via HPC", job_id)
 
         except Exception as e:
-            job.status = JobStatus.FAILED
-            job.error = f"Post-processing failed: {str(e)}\n{traceback.format_exc()}"
-            job.completed_at = datetime.utcnow()
+            diagnostics = await self._hpc_diagnostics(hpc_job_dir, slurm_job_id)
+            self._set_failed(
+                job,
+                f"Post-processing failed: {str(e)}\n{traceback.format_exc()}"
+                + (f"\n\n{diagnostics}" if diagnostics else ""),
+            )
             logger.error("Job %s post-processing failed: %s", job_id, str(e))
 
         finally:
@@ -536,5 +609,6 @@ class HPCDispatcher(JobDispatcher):
             self._active_slurm_ids.remove(slurm_job_id)
         self._slurm_to_job.pop(slurm_job_id, None)
         self._job_start_times.pop(job_id, None)
+        self._finalizing_slurm_ids.discard(slurm_job_id)
         if self._submit_semaphore:
             self._submit_semaphore.release()

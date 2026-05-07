@@ -34,9 +34,15 @@ MODEL_REGISTRY = {
     "rice_plant_counter_v1": "models.rice_plant_counter.RicePlantCounter",
 }
 
+MODEL_ID_ALIASES = {
+    # Historical frontend/API default. Keep this so stale jobs do not fail on HPC.
+    "wheat_plant_counter_v1": "rice_plant_counter_v1",
+}
+
 
 def load_model_class(model_id: str):
     """Dynamically import and return the model class for a given model_id."""
+    model_id = MODEL_ID_ALIASES.get(model_id, model_id)
     if model_id not in MODEL_REGISTRY:
         raise ValueError(
             f"Unknown model_id '{model_id}'. Available: {list(MODEL_REGISTRY.keys())}"
@@ -66,7 +72,7 @@ def main():
         config = json.load(f)
 
     job_id = config["job_id"]
-    model_id = config["model_id"]
+    model_id = MODEL_ID_ALIASES.get(config["model_id"], config["model_id"])
     image_path = os.path.expanduser(config["image_path"])
     weights_dir = os.path.expanduser(config["weights_dir"])
     output_dir = os.path.expanduser(config["output_dir"])

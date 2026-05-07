@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from app.jobs.models import JobRecord, JobStatus
+from app.models.registry import registry
 
 router = APIRouter()
 
@@ -45,7 +46,7 @@ async def submit_job(request: JobSubmitRequest):
         raise HTTPException(status_code=503, detail="Job dispatcher not initialized")
 
     job = JobRecord(
-        model_id=request.model_id,
+        model_id=registry.resolve_model_id(request.model_id),
         input_params={
             "image_path": request.image_path,
             "image_url": request.image_url,

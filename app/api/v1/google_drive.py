@@ -39,6 +39,7 @@ DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
 
 class ListFilesRequest(BaseModel):
     input: str  # Any Google Drive URL, folder URL, file URL, or raw ID
+    allowed_types: str = "geotiff"  # "geotiff" for drone imagery, "image" for plant counter
 
 
 class ImportRequest(BaseModel):
@@ -203,6 +204,15 @@ def _is_geotiff(f: dict) -> bool:
     return name.endswith(".tif") or name.endswith(".tiff") or f.get("mimeType") == "image/tiff"
 
 
+def _is_supported_image(f: dict) -> bool:
+    name = f.get("name", "").lower()
+    mime = f.get("mimeType", "")
+    return (
+        name.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg"))
+        or mime in {"image/tiff", "image/png", "image/jpeg"}
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -248,8 +258,17 @@ async def list_files(req: ListFilesRequest):
                            "Make sure the link is correct and the content is shared publicly.",
                 )
 
-    geotiff_files = [f for f in files if _is_geotiff(f)]
-    skipped = len(files) - len(geotiff_files)
+    if req.allowed_types == "image":
+        accepted_files = [f for f in files if _is_supported_image(f)]
+    elif req.allowed_types == "geotiff":
+        accepted_files = [f for f in files if _is_geotiff(f)]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="allowed_types must be either 'geotiff' or 'image'",
+        )
+
+    skipped = len(files) - len(accepted_files)
 
     return {
         "type": resolved_type,
@@ -260,7 +279,7 @@ async def list_files(req: ListFilesRequest):
                 "size": int(f.get("size", 0)),
                 "mimeType": f.get("mimeType", ""),
             }
-            for f in geotiff_files
+            for f in accepted_files
         ],
         "skipped_count": skipped,
     }

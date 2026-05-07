@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import time
 import torch
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -19,6 +20,7 @@ from app.api.v1.health import router as health_root_router
 from app.api.v1 import jobs as jobs_api
 from app.api.v1 import analysis as analysis_api
 from app.api.v1 import upload as upload_api
+from app.api.v1 import chunked_upload as chunked_upload_api
 from app.models.registry import registry
 from app.jobs.models import JobRecord, JobStatus
 from app.jobs.in_process_queue import InProcessQueue
@@ -39,6 +41,20 @@ def run_model_job(job: JobRecord) -> JobRecord:
     This is intentionally synchronous — all operations are CPU/GPU bound.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Drive-based jobs are queued before the background download has a path.
+    if job.input_params.get("awaiting_download"):
+        deadline = time.time() + 3600
+        while job.input_params.get("awaiting_download") and time.time() < deadline:
+            job.progress_message = "Downloading image from Google Drive..."
+            time.sleep(1)
+        if job.status == JobStatus.FAILED:
+            return job
+        if job.input_params.get("awaiting_download"):
+            job.status = JobStatus.FAILED
+            job.error = "Timed out while downloading image from Google Drive"
+            job.completed_at = datetime.utcnow()
+            return job
 
     # Find and load the model
     model = registry.ensure_loaded(job.model_id, device=device)
@@ -185,7 +201,10 @@ async def lifespan(app: FastAPI):
     jobs_api.set_dispatcher(_dispatcher)
     jobs_api.set_temp_store(temp_store)
     analysis_api.set_dispatcher(_dispatcher)
+    analysis_api.set_temp_store(temp_store)
     upload_api.set_dispatcher(_dispatcher)
+    chunked_upload_api.set_dispatcher(_dispatcher)
+    chunked_upload_api.set_temp_store(temp_store)
 
     # Periodic cleanup: remove expired job temp dirs every hour
     async def _periodic_temp_cleanup():

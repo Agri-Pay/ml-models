@@ -29,8 +29,24 @@ from app.api.v1.imagery_helpers import (
     build_filename,
     register_imagery_in_db,
 )
+from app.jobs.models import JobRecord
+from app.models.registry import registry
 
 router = APIRouter(prefix="/imagery/upload", tags=["chunked-upload"])
+
+# Wired by main.py during lifespan (only needed for analyze=True mode)
+_dispatcher = None
+_temp_store = None
+
+
+def set_dispatcher(dispatcher):
+    global _dispatcher
+    _dispatcher = dispatcher
+
+
+def set_temp_store(store):
+    global _temp_store
+    _temp_store = store
 
 # Where partial uploads are stored — on the mounted volume so they are
 # visible on the host and survive container restarts.  The leading dot
@@ -49,8 +65,8 @@ CHUNK_SIZE = 50 * 1024 * 1024
 class UploadInitRequest(BaseModel):
     filename: str
     total_size: int
-    farm_id: str
-    flight_date: str  # YYYY-MM-DD
+    farm_id: Optional[str] = None   # None signals analyze=True (Plant Counter) mode
+    flight_date: Optional[str] = None  # YYYY-MM-DD; None allowed in analyze mode
     layer_type: str = "rgb"
     content_type: str = "image/tiff"
 
@@ -105,27 +121,39 @@ async def init_upload(req: UploadInitRequest):
 
     Returns an upload_id and recommended chunk_size.
     """
-    # Validate filename
+    analyze_mode = req.farm_id is None  # True = Plant Counter upload, skip DB fields
+
+    # Validate filename extension
     ext = os.path.splitext(req.filename)[1].lower()
-    if ext not in (".tif", ".tiff"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only GeoTIFF files (.tif/.tiff) are accepted, got '{ext}'",
-        )
+    if analyze_mode:
+        # Plant Counter accepts PNG, JPEG, TIFF
+        if ext not in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type '{ext}'. Accepted: .tif, .tiff, .png, .jpg, .jpeg",
+            )
+    else:
+        if ext not in (".tif", ".tiff"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only GeoTIFF files (.tif/.tiff) are accepted, got '{ext}'",
+            )
 
-    # Validate layer_type
     lt = req.layer_type.lower()
-    if lt not in VALID_LAYER_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid layer_type '{lt}'. Must be one of: {sorted(VALID_LAYER_TYPES)}",
-        )
 
-    # Validate date format
-    try:
-        datetime.strptime(req.flight_date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="flight_date must be in YYYY-MM-DD format")
+    if not analyze_mode:
+        # Validate layer_type only for imagery uploads
+        if lt not in VALID_LAYER_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid layer_type '{lt}'. Must be one of: {sorted(VALID_LAYER_TYPES)}",
+            )
+
+        # Validate date format
+        try:
+            datetime.strptime(req.flight_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="flight_date must be in YYYY-MM-DD format")
 
     # Validate total_size
     if req.total_size <= 0:
@@ -150,6 +178,7 @@ async def init_upload(req: UploadInitRequest):
         "content_type": req.content_type,
         "received_bytes": 0,
         "created_at": datetime.utcnow().isoformat(),
+        "analyze_mode": analyze_mode,
     }
     _write_meta(upload_id, meta)
 
@@ -264,8 +293,18 @@ async def get_upload_status(upload_id: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/{upload_id}/complete")
-async def complete_upload(upload_id: str, req: Optional[UploadCompleteRequest] = None):
-    """Finalize a chunked upload: move file to imagery dir and register in DB."""
+async def complete_upload(
+    upload_id: str,
+    req: Optional[UploadCompleteRequest] = None,
+    analyze: bool = False,
+    model_id: str = "rice_plant_counter_v1",
+):
+    """Finalize a chunked upload.
+
+    Normal mode: move file to imagery dir and register in DB.
+    Analyze mode (analyze=True or farm_id was None at init): submit ML job and
+    return a job_id for polling without touching the imagery database.
+    """
     meta = _read_meta(upload_id)
 
     # Validate all bytes received
@@ -275,12 +314,45 @@ async def complete_upload(upload_id: str, req: Optional[UploadCompleteRequest] =
             detail=f"Upload incomplete: received {meta['received_bytes']} of {meta['total_size']} bytes",
         )
 
+    part_path = os.path.join(_get_upload_dir(upload_id), "file.part")
+
+    # ── Analyze mode: submit ML job, skip DB registration ──────────────────
+    if analyze or meta.get("analyze_mode"):
+        if _dispatcher is None or _temp_store is None:
+            raise HTTPException(status_code=503, detail="Dispatcher not ready")
+
+        job = JobRecord(model_id=registry.resolve_model_id(model_id), input_params={})
+        job_dir = _temp_store.get_job_dir(job.id)
+
+        # Move uploaded file into the job's temp directory
+        ext = os.path.splitext(meta["original_filename"])[1].lower() or ".tif"
+        dest_path = os.path.join(job_dir, f"input{ext}")
+        try:
+            shutil.move(part_path, dest_path)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to stage file for analysis: {exc}")
+
+        job.input_params["image_path"] = dest_path
+        job.input_params["original_filename"] = meta["original_filename"]
+
+        # Clean up the upload temp dir (file already moved)
+        upload_dir = _get_upload_dir(upload_id)
+        if os.path.exists(upload_dir):
+            shutil.rmtree(upload_dir, ignore_errors=True)
+
+        await _dispatcher.submit(job)
+        return {
+            "job_id": job.id,
+            "status": "pending",
+            "message": "File received, analysis job queued.",
+        }
+
+    # ── Normal imagery mode ─────────────────────────────────────────────────
     # Build destination filename
     filename = build_filename(meta["farm_id"], meta["flight_date"], meta["layer_type"])
     dest_path = os.path.join(settings.imagery_dir, filename)
 
     # Move partial file to final destination
-    part_path = os.path.join(_get_upload_dir(upload_id), "file.part")
     try:
         shutil.move(part_path, dest_path)
     except Exception as exc:

@@ -10,6 +10,12 @@ from app.config import settings
 from app.models.base import BaseModel, ModelSpec
 
 
+MODEL_ID_ALIASES = {
+    # Historical frontend/API default. The actual registered model is rice.
+    "wheat_plant_counter_v1": "rice_plant_counter_v1",
+}
+
+
 class ModelRegistry:
     """Discovers, manages, and serves ML models.
 
@@ -69,13 +75,20 @@ class ModelRegistry:
 
     def get(self, model_id: str) -> Optional[BaseModel]:
         """Get a model by ID."""
+        model_id = self.resolve_model_id(model_id)
         return self._models.get(model_id)
+
+    @staticmethod
+    def resolve_model_id(model_id: str) -> str:
+        """Return the canonical model ID for known historical aliases."""
+        return MODEL_ID_ALIASES.get(model_id, model_id)
 
     def ensure_loaded(self, model_id: str, device: str = "cpu") -> BaseModel:
         """Ensure a model is loaded, loading it if necessary.
 
         Uses LRU eviction to stay within max_loaded_models limit.
         """
+        model_id = self.resolve_model_id(model_id)
         model = self._models.get(model_id)
         if model is None:
             raise ValueError(f"Model '{model_id}' not found in registry")
